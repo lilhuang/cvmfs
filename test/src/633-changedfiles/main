@@ -89,11 +89,7 @@ cvmfs_run_test() {
   sudo cvmfs_talk -p ${mntpnt}c/$CVMFS_TEST_REPO/cvmfs_io.$CVMFS_TEST_REPO remount || return 40
   echo "waiting for kernel caches to drain out"
   sleep 10
-<<<<<<< HEAD
-  local revision_new=$(attr -qg revision ${mntpnt}) || return 41
-=======
   local revision_new=$(get_xattr revision ${mntpnt}) || return 41
->>>>>>> cvmfs-2.3
   echo "revision is now $revision_new"
   [ $revision_new -gt $revision_old ] || return 42
 

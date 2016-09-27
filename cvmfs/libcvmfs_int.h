@@ -19,7 +19,6 @@
 #include "catalog_mgr.h"
 #include "file_chunk.h"
 #include "lru.h"
-#include "util.h"
 
 namespace cache {
 class CacheManager;
@@ -117,7 +116,6 @@ class cvmfs_globals : SingleCopy {
   gid_t             gid_;
   int               fd_lockfile_;
   pthread_mutex_t  *libcrypto_locks_;
-  void             *sqlite_page_cache;
   bool lock_created_;
   bool vfs_registered_;
 };
@@ -202,7 +200,6 @@ class cvmfs_context : SingleCopy {
    * Expected repository name, e.g. atlas.cern.ch
    */
   std::string repository_name_;
-  pid_t pid_;  /**< will be set after deamon() */
   time_t boot_time_;
   catalog::ClientCatalogManager *catalog_manager_;
   signature::SignatureManager *signature_manager_;
@@ -229,8 +226,6 @@ class cvmfs_context : SingleCopy {
 
   BackoffThrottle backoff_throttle_;
   SimpleChunkTables chunk_tables_;
-
-  int fd_lockfile;
 
   bool download_ready_;
   bool external_download_ready_;

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "cache.h"
+#include "catalog_mgr_client.h"
 #include "cvmfs.h"
 #include "download.h"
 #include "duplex_sqlite3.h"
@@ -45,7 +46,6 @@
 #include "shortstring.h"
 #include "statistics.h"
 #include "tracer.h"
-#include "util.h"
 #include "wpad.h"
 
 using namespace std;  // NOLINT
@@ -102,6 +102,34 @@ static std::string GenerateHostInfo(download::DownloadManager *manager) {
   host_str += "Active host " + StringifyInt(active_host) + ": " +
               host_chain[active_host] + "\n";
   return host_str;
+}
+
+static std::string GenerateProxyInfo(download::DownloadManager *manager) {
+  vector< vector<download::DownloadManager::ProxyInfo> > proxy_chain;
+  unsigned active_group;
+  unsigned fallback_group;
+
+  manager->GetProxyInfo(&proxy_chain, &active_group, &fallback_group);
+  string proxy_str;
+  if (proxy_chain.size()) {
+    proxy_str += "Load-balance groups:\n";
+    for (unsigned i = 0; i < proxy_chain.size(); ++i) {
+      vector<string> urls;
+      for (unsigned j = 0; j < proxy_chain[i].size(); ++j) {
+        urls.push_back(proxy_chain[i][j].Print());
+      }
+      proxy_str +=
+        "[" + StringifyInt(i) + "] " + JoinStrings(urls, ", ") + "\n";
+    }
+    proxy_str += "Active proxy: [" + StringifyInt(active_group) + "] " +
+                 proxy_chain[active_group][0].url + "\n";
+    if (fallback_group < proxy_chain.size())
+      proxy_str += "First fallback group: [" +
+                   StringifyInt(fallback_group) + "]\n";
+  } else {
+    proxy_str = "No proxies defined\n";
+  }
+  return proxy_str;
 }
 
 static void *MainTalk(void *data __attribute__((unused))) {
@@ -247,6 +275,9 @@ static void *MainTalk(void *data __attribute__((unused))) {
           default:
             Answer(con_fd, "internal error\n");
         }
+      } else if (line == "detach nested catalogs") {
+        cvmfs::catalog_manager_->DetachNested();
+        Answer(con_fd, "OK\n");
       } else if (line == "revision") {
         Answer(con_fd, StringifyInt(cvmfs::GetRevision()) + "\n");
       } else if (line == "max ttl info") {
@@ -289,11 +320,11 @@ static void *MainTalk(void *data __attribute__((unused))) {
       } else if (line == "host switch") {
         cvmfs::download_manager_->SwitchHost();
         Answer(con_fd, "OK\n");
-      } else if (line.substr(0, 16) == "external host set") {
-        if (line.length() < 18) {
+      } else if (line.substr(0, 17) == "external host set") {
+        if (line.length() < 19) {
           Answer(con_fd, "Usage: external host set <URL>\n");
         } else {
-          const std::string host = line.substr(17);
+          const std::string host = line.substr(18);
           cvmfs::external_download_manager_->SetHostChain(host);
           Answer(con_fd, "OK\n");
         }
@@ -305,40 +336,25 @@ static void *MainTalk(void *data __attribute__((unused))) {
           cvmfs::download_manager_->SetHostChain(hosts);
           Answer(con_fd, "OK\n");
         }
+      } else if (line == "external proxy info") {
+        Answer(con_fd, GenerateProxyInfo(cvmfs::external_download_manager_));
       } else if (line == "proxy info") {
-        vector< vector<download::DownloadManager::ProxyInfo> > proxy_chain;
-        unsigned active_group;
-        unsigned fallback_group;
-        cvmfs::download_manager_->GetProxyInfo(
-          &proxy_chain, &active_group, &fallback_group);
-
-        string proxy_str;
-        if (proxy_chain.size()) {
-          proxy_str += "Load-balance groups:\n";
-          for (unsigned i = 0; i < proxy_chain.size(); ++i) {
-            vector<string> urls;
-            for (unsigned j = 0; j < proxy_chain[i].size(); ++j) {
-              urls.push_back(proxy_chain[i][j].Print());
-            }
-            proxy_str +=
-              "[" + StringifyInt(i) + "] " + JoinStrings(urls, ", ") + "\n";
-          }
-          proxy_str += "Active proxy: [" + StringifyInt(active_group) + "] " +
-                       proxy_chain[active_group][0].url + "\n";
-          if (fallback_group < proxy_chain.size())
-            proxy_str += "First fallback group: [" +
-                         StringifyInt(fallback_group) + "]\n";
-        } else {
-          proxy_str = "No proxies defined\n";
-        }
-
-        Answer(con_fd, proxy_str);
+        Answer(con_fd, GenerateProxyInfo(cvmfs::download_manager_));
       } else if (line == "proxy rebalance") {
         cvmfs::download_manager_->RebalanceProxies();
         Answer(con_fd, "OK\n");
       } else if (line == "proxy group switch") {
         cvmfs::download_manager_->SwitchProxyGroup();
         Answer(con_fd, "OK\n");
+      } else if (line.substr(0, 18) == "external proxy set") {
+        if (line.length() < 20) {
+          Answer(con_fd, "Usage: external proxy set <proxy list>\n");
+        } else {
+          string external_proxies = line.substr(19);
+          cvmfs::external_download_manager_->SetProxyChain(
+            external_proxies, "", download::DownloadManager::kSetProxyRegular);
+          Answer(con_fd, "OK\n");
+        }
       } else if (line.substr(0, 9) == "proxy set") {
         if (line.length() < 11) {
           Answer(con_fd, "Usage: proxy set <proxy list>\n");
@@ -488,6 +504,9 @@ static void *MainTalk(void *data __attribute__((unused))) {
         sqlite3_status(SQLITE_STATUS_SCRATCH_SIZE, &current, &highwater, 0);
         result += "  Largest scratch allocation " + StringifyInt(highwater/1024)
                   + " KB\n";
+
+        result += "\nPer-Connection Memory Statistics:\n" +
+                  cvmfs::catalog_manager_->PrintAllMemStatistics();
 
         result += "\nRaw Counters:\n" +
           cvmfs::statistics_->PrintList(perf::Statistics::kPrintHeader);

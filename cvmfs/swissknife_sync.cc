@@ -39,9 +39,9 @@
 #include "manifest.h"
 #include "path_filters/dirtab.h"
 #include "platform.h"
+#include "reflog.h"
 #include "sync_mediator.h"
 #include "sync_union.h"
-#include "util.h"
 
 using namespace std;  // NOLINT
 
@@ -93,6 +93,8 @@ int swissknife::CommandCreate::Main(const swissknife::ArgumentList &args) {
   const string manifest_path = *args.find('o')->second;
   const string dir_temp = *args.find('t')->second;
   const string spooler_definition = *args.find('r')->second;
+  const string repo_name = *args.find('n')->second;
+  const string reflog_chksum_path = *args.find('R')->second;
   if (args.find('l') != args.end()) {
     unsigned log_level =
       1 << (kLogLevel0 + String2Uint64(*args.find('l')->second));
@@ -134,8 +136,21 @@ int swissknife::CommandCreate::Main(const swissknife::ArgumentList &args) {
     return 1;
   }
 
+  UniquePtr<manifest::Reflog> reflog(CreateEmptyReflog(dir_temp, repo_name));
+  if (!reflog.IsValid()) {
+    PrintError("Failed to create fresh Reflog");
+    return 1;
+  }
+
+  reflog->DropDatabaseFileOwnership();
+  string reflog_path = reflog->database_file();
+  reflog.Destroy();
+  shash::Any reflog_hash(hash_algorithm);
+  manifest::Reflog::HashDatabase(reflog_path, &reflog_hash);
+  spooler->UploadReflog(reflog_path);
   spooler->WaitForUpload();
   delete spooler;
+  manifest::Reflog::WriteChecksum(reflog_chksum_path, reflog_hash);
 
   // set optional manifest fields
   const bool needs_bootstrap_shortcuts = !voms_authz.empty();
@@ -583,8 +598,15 @@ int swissknife::CommandSync::Main(const swissknife::ArgumentList &args) {
                                                params.max_concurrent_write_jobs;
   }
 
+  upload::SpoolerDefinition spooler_definition_catalogs(
+    spooler_definition.Dup2DefaultCompression());
+
   params.spooler = upload::Spooler::Construct(spooler_definition);
   if (NULL == params.spooler)
+    return 3;
+  UniquePtr<upload::Spooler> spooler_catalogs(
+    upload::Spooler::Construct(spooler_definition_catalogs));
+  if (!spooler_catalogs.IsValid())
     return 3;
 
   const bool follow_redirects = (args.count('L') > 0);
@@ -592,7 +614,8 @@ int swissknife::CommandSync::Main(const swissknife::ArgumentList &args) {
     return 3;
   }
 
-  if (!this->InitSignatureManager(params.public_keys, params.trusted_certs)) {
+  if (!this->InitVerifyingSignatureManager(params.public_keys,
+                                           params.trusted_certs)) {
     return 3;
   }
 
@@ -606,7 +629,7 @@ int swissknife::CommandSync::Main(const swissknife::ArgumentList &args) {
 
   catalog::WritableCatalogManager
     catalog_manager(params.base_hash, params.stratum0, params.dir_temp,
-                    params.spooler, download_manager(),
+                    spooler_catalogs, download_manager(),
                     params.catalog_entry_warn_threshold,
                     statistics(),
                     params.is_balanced,
@@ -659,14 +682,16 @@ int swissknife::CommandSync::Main(const swissknife::ArgumentList &args) {
     }
 
     std::string new_authz;
-    if (!SafeReadToString(fd, &new_authz)) {
+    const bool read_successful = SafeReadToString(fd, &new_authz);
+    close(fd);
+
+    if (!read_successful) {
       LogCvmfs(kLogCvmfs, kLogStderr, "Failed to read authz file (%s): %s",
                params.authz_file.c_str(),
                strerror(errno));
       return 8;
     }
 
-    close(fd);
     catalog_manager.SetVOMSAuthz(new_authz);
   }
 
@@ -678,6 +703,7 @@ int swissknife::CommandSync::Main(const swissknife::ArgumentList &args) {
   // finalize the spooler
   LogCvmfs(kLogCvmfs, kLogStdout, "Exporting repository manifest");
   params.spooler->WaitForUpload();
+  spooler_catalogs->WaitForUpload();
   delete params.spooler;
 
   if (!manifest->Export(params.manifest_path)) {

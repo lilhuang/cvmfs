@@ -13,14 +13,11 @@
 #include "logging.h"
 #include "platform.h"
 #include "smalloc.h"
-#include "util.h"
 #include "util_concurrency.h"
 
 using namespace std;  // NOLINT
 
 namespace catalog {
-
-const int kSqliteThreadMem = 4;  /**< TODO SQLite3 heap limit per thread */
 
 
 /**
@@ -70,7 +67,6 @@ Catalog::Catalog(const PathString &path,
   gid_map_ = NULL;
   sql_listing_ = NULL;
   sql_lookup_md5path_ = NULL;
-  sql_lookup_inode_ = NULL;
   sql_lookup_nested_ = NULL;
   sql_list_nested_ = NULL;
   sql_all_chunks_ = NULL;
@@ -96,7 +92,6 @@ Catalog::~Catalog() {
 void Catalog::InitPreparedStatements() {
   sql_listing_         = new SqlListing(database());
   sql_lookup_md5path_  = new SqlLookupPathHash(database());
-  sql_lookup_inode_    = new SqlLookupInode(database());
   sql_lookup_nested_   = new SqlNestedCatalogLookup(database());
   sql_list_nested_     = new SqlNestedCatalogListing(database());
   sql_all_chunks_      = new SqlAllChunks(database());
@@ -111,7 +106,6 @@ void Catalog::FinalizePreparedStatements() {
   delete sql_all_chunks_;
   delete sql_listing_;
   delete sql_lookup_md5path_;
-  delete sql_lookup_inode_;
   delete sql_lookup_nested_;
   delete sql_list_nested_;
 }
@@ -170,7 +164,7 @@ bool Catalog::OpenDatabase(const string &db_path) {
   }
 
   // Find out the maximum row id of this database file
-  Sql sql_max_row_id(database(), "SELECT MAX(rowid) FROM catalog;");
+  SqlCatalog sql_max_row_id(database(), "SELECT MAX(rowid) FROM catalog;");
   if (!sql_max_row_id.FetchRow()) {
     LogCvmfs(kLogCatalog, kLogDebug,
              "Cannot retrieve maximal row id for database file %s "
@@ -470,7 +464,7 @@ uint64_t Catalog::GetNumEntries() const {
   const string sql = "SELECT count(*) FROM catalog;";
 
   pthread_mutex_lock(lock_);
-  Sql stmt(database(), sql);
+  SqlCatalog stmt(database(), sql);
   const uint64_t result = (stmt.FetchRow()) ? stmt.RetrieveInt64(0) : 0;
   pthread_mutex_unlock(lock_);
 
@@ -486,6 +480,25 @@ shash::Any Catalog::GetPreviousRevision() const {
   return (!hash_string.empty())
     ? shash::MkFromHexPtr(shash::HexPtr(hash_string), shash::kSuffixCatalog)
     : shash::Any();
+}
+
+
+string Catalog::PrintMemStatistics() const {
+  sqlite::MemStatistics stats;
+  pthread_mutex_lock(lock_);
+  database().GetMemStatistics(&stats);
+  pthread_mutex_unlock(lock_);
+  return string(path().GetChars(), path().GetLength()) + ": " +
+    StringifyInt(stats.lookaside_slots_used) + " / " +
+      StringifyInt(stats.lookaside_slots_max) + " slots -- " +
+      StringifyInt(stats.lookaside_hit) + " hits, " +
+      StringifyInt(stats.lookaside_miss_size) + " misses-size, " +
+      StringifyInt(stats.lookaside_miss_full) + " misses-full -- " +
+    StringifyInt(stats.page_cache_used / 1024) + " kB pages -- " +
+      StringifyInt(stats.page_cache_hit) + " hits, " +
+      StringifyInt(stats.page_cache_miss) + " misses -- " +
+    StringifyInt(stats.schema_used / 1024) + " kB schema -- " +
+    StringifyInt(stats.stmt_used / 1024) + " kB statements";
 }
 
 
@@ -570,12 +583,13 @@ const Catalog::NestedCatalogList& Catalog::ListNestedCatalogs() const {
 /**
  * Drops the nested catalog cache. Usually this is only useful in subclasses
  * that implement writable catalogs.
+ *
+ * Note: this action is _not_ secured by the catalog's mutex. If serialisation
+ *       is required the subclass needs to ensure that.
  */
-void Catalog::ResetNestedCatalogCache() {
-  pthread_mutex_lock(lock_);
+void Catalog::ResetNestedCatalogCacheUnprotected() {
   nested_catalog_cache_.clear();
   nested_catalog_cache_dirty_ = true;
-  pthread_mutex_unlock(lock_);
 }
 
 

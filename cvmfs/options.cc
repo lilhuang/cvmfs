@@ -20,7 +20,8 @@
 
 #include "logging.h"
 #include "sanitizer.h"
-#include "util.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -58,7 +59,6 @@ void SimpleOptionsParser::ParsePath(const string &config_file,
                                  const bool external __attribute__((unused))) {
   LogCvmfs(kLogCvmfs, kLogDebug, "Fast-parsing config file %s",
       config_file.c_str());
-  int retval;
   string line;
   FILE *fconfig = fopen(config_file.c_str(), "r");
   if (fconfig == NULL)
@@ -77,9 +77,7 @@ void SimpleOptionsParser::ParsePath(const string &config_file,
     value.source = config_file;
     value.value = tokens[1];
     string parameter = tokens[0];
-    config_[parameter] = value;
-    retval = setenv(parameter.c_str(), value.value.c_str(), 1);
-    assert(retval == 0);
+    PopulateParameter(parameter, value);
   }
   fclose(fconfig);
 }
@@ -193,9 +191,7 @@ void BashOptionsManager::ParsePath(const string &config_file,
     const string sh_echo = "echo $" + parameter + "\n";
     WritePipe(fd_stdin, sh_echo.data(), sh_echo.length());
     GetLineFd(fd_stdout, &value.value);
-    config_[parameter] = value;
-    retval = setenv(parameter.c_str(), value.value.c_str(), 1);
-    assert(retval == 0);
+    PopulateParameter(parameter, value);
   }
 
   close(fd_stderr);
@@ -235,15 +231,17 @@ void OptionsManager::ParseDefault(const string &fqrn) {
   int retval = setenv("CVMFS_FQRN", fqrn.c_str(), 1);
   assert(retval == 0);
 
+  protected_parameters_.clear();
+
   ParsePath("/etc/cvmfs/default.conf", false);
   vector<string> dist_defaults = FindFiles("/etc/cvmfs/default.d", ".conf");
   for (unsigned i = 0; i < dist_defaults.size(); ++i) {
     ParsePath(dist_defaults[i], false);
   }
+  ProtectParameter("CVMFS_CONFIG_REPOSITORY");
   string external_config_path;
-  // This change breaks a number of integration tests.  Move to version 2.3.
-  // if ((fqrn != "") && HasConfigRepository(fqrn, &external_config_path))
-  //  ParsePath(external_config_path + "default.conf", true);
+  if ((fqrn != "") && HasConfigRepository(fqrn, &external_config_path))
+    ParsePath(external_config_path + "default.conf", true);
   ParsePath("/etc/cvmfs/default.local", false);
 
   if (fqrn != "") {
@@ -263,6 +261,34 @@ void OptionsManager::ParseDefault(const string &fqrn) {
     ParsePath("/etc/cvmfs/config.d/" + fqrn + ".conf", false);
     ParsePath("/etc/cvmfs/config.d/" + fqrn + ".local", false);
   }
+}
+
+
+void OptionsManager::PopulateParameter(
+  const string &param,
+  const ConfigValue val)
+{
+  map<string, string>::const_iterator iter = protected_parameters_.find(param);
+  if ((iter != protected_parameters_.end()) && (iter->second != val.value)) {
+    LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogErr,
+             "error in cvmfs configuration: attempt to change protected %s "
+             "from %s to %s",
+             param.c_str(), iter->second.c_str(), val.value.c_str());
+    return;
+  }
+
+  config_[param] = val;
+  int retval = setenv(param.c_str(), val.value.c_str(), 1);
+  assert(retval == 0);
+}
+
+
+void OptionsManager::ProtectParameter(const string &param) {
+  string value;
+  // We don't care about the result.  If param does not yet exists, we lock it
+  // to the empty string.
+  (void) GetValue(param, &value);
+  protected_parameters_[param] = value;
 }
 
 
@@ -311,6 +337,26 @@ vector<string> OptionsManager::GetAllKeys() {
        iEnd = config_.end(); i != iEnd; ++i)
   {
     result.push_back(i->first);
+  }
+  return result;
+}
+
+
+vector<string> OptionsManager::GetEnvironmentSubset(
+  const string &key_prefix,
+  bool strip_prefix)
+{
+  vector<string> result;
+  for (map<string, ConfigValue>::const_iterator i = config_.begin(),
+       iEnd = config_.end(); i != iEnd; ++i)
+  {
+    const bool ignore_prefix = false;
+    if (HasPrefix(i->first, key_prefix, ignore_prefix)) {
+      const string output_key = strip_prefix
+        ? i->first.substr(key_prefix.length())
+        : i->first;
+      result.push_back(output_key + "=" + i->second.value);
+    }
   }
   return result;
 }

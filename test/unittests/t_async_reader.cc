@@ -10,11 +10,11 @@
 
 #include <cassert>
 
-#include "../../cvmfs/file_processing/async_reader.h"
-#include "../../cvmfs/file_processing/char_buffer.h"
-#include "../../cvmfs/file_processing/file_scrubbing_task.h"
-#include "../../cvmfs/util.h"
 #include "c_file_sandbox.h"
+#include "file_processing/async_reader.h"
+#include "file_processing/char_buffer.h"
+#include "file_processing/file_scrubbing_task.h"
+#include "util/posix.h"
 
 namespace upload {
 
@@ -341,7 +341,7 @@ TEST_F(T_AsyncReader, MultipleWaitsSlow) {
                                   static_cast<void*>(&files));
   ASSERT_EQ(0, res);
 
-  unsigned int timeout = 10;
+  unsigned int timeout = 30;
   while (pthread_kill(thread, 0) != ESRCH && timeout > 0) {
     sleep(1);
     --timeout;

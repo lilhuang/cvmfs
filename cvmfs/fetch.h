@@ -16,7 +16,6 @@
 #include "gtest/gtest_prod.h"
 #include "hash.h"
 #include "sink.h"
-#include "util.h"
 
 class BackoffThrottle;
 
@@ -97,6 +96,7 @@ class Fetcher : SingleCopy {
     ThreadLocalStorage() {
       pipe_wait[0] = -1;
       pipe_wait[1] = -1;
+      fetcher = NULL;
     }
 
     /**

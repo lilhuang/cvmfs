@@ -8,7 +8,7 @@
 #include <vector>
 
 #include "logging.h"
-#include "util.h"
+#include "util/string.h"
 
 namespace upload {
 
@@ -63,6 +63,13 @@ SpoolerDefinition::SpoolerDefinition(
   temporary_path        = upstream[1];
   spooler_configuration = upstream[2];
   valid_ = true;
+}
+
+
+SpoolerDefinition SpoolerDefinition::Dup2DefaultCompression() const {
+  SpoolerDefinition result(*this);
+  result.compression_alg = zlib::kZlibDefault;
+  return result;
 }
 
 }  // namespace upload

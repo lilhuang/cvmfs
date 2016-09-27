@@ -33,8 +33,6 @@ CVMFS_TEST_CLASS_NAME=ServerIntegrationTests                                  \
                               -x src/518-hardlinkstresstest                   \
                                  src/523-corruptchunkfailover                 \
                                  src/524-corruptmanifestfailover              \
-                                 src/577-garbagecollecthiddenstratum1revision \
-                                 src/579-garbagecollectstratum1legacytag      \
                                  src/585-xattrs                               \
                                  src/600-securecvmfs                          \
                                  --                                           \
@@ -44,10 +42,9 @@ CVMFS_TEST_CLASS_NAME=ServerIntegrationTests                                  \
 
 
 echo "NOT running CernVM-FS migration test cases (disabled)..."
-# TODO(rmeusel): enable this when there is a 'previous version' for FC23
-# CVMFS_TEST_CLASS_NAME=MigrationTests                                              \
-# ./run.sh $MIGRATIONTEST_LOGFILE -o ${MIGRATIONTEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
-#                                    migration_tests/*                              \
-#                                 || retval=1
+CVMFS_TEST_CLASS_NAME=MigrationTests                                              \
+./run.sh $MIGRATIONTEST_LOGFILE -o ${MIGRATIONTEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
+                                   migration_tests/*                              \
+                                || retval=1
 
 exit $retval

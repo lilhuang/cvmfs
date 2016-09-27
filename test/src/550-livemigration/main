@@ -76,12 +76,11 @@ initiate_reload() {
 }
 
 
-TEST550_MAX_WAITING_TIMEOUT=300
+TEST550_MAX_WAITING_TIMEOUT=1000
 wait_for_revision() {
   local mountpoint="$1"
   local repo_name="$2"
   local expected_revision="$3"
-  local talk_pipe="$(get_talk_pipe $mountpoint $repo_name)"
   local waited=0
   local revision=0
   local interval=5
@@ -89,7 +88,7 @@ wait_for_revision() {
   echo -n "waiting for revision $expected_revision to become picked up by $mountpoint ..."
   while [ $waited -lt $TEST550_MAX_WAITING_TIMEOUT ] && [ $revision -ne $expected_revision ]; do
     ls $mountpoint > /dev/null 2>&1 || return 2
-    revision="$(cvmfs_talk -p $talk_pipe revision)"
+    revision="$(get_xattr revision $mountpoint)"
     if [ x"$revision" = x"$expected_revision" ]; then
       echo " done"
       return 0
@@ -98,7 +97,7 @@ wait_for_revision() {
     sleep $interval
     waited=$(( $waited + $interval ))
   done
-  echo " Timeout!"
+  echo " Timeout! (revision was $revision, expected revision was $expected_revision)"
   return 1
 }
 
@@ -224,9 +223,13 @@ cvmfs_run_test() {
   initiate_reload "$s0_mnt" "$legacy_repo_name" || return 17
   initiate_reload "$s1_mnt" "$legacy_repo_name" || return 18
 
-  echo "wait for the clients to pick up revision 7"
-  wait_for_revision "$s0_mnt" "$legacy_repo_name" 7 || return 19
-  wait_for_revision "$s1_mnt" "$legacy_repo_name" 7 || return 20
+  local migrate_revision=7
+  if uses_overlayfs $legacy_repo_name; then
+    migrate_revision=8
+  fi
+  echo "wait for the clients to pick up revision $migrate_revision"
+  wait_for_revision "$s0_mnt" "$legacy_repo_name" $migrate_revision || return 19
+  wait_for_revision "$s1_mnt" "$legacy_repo_name" $migrate_revision || return 20
 
   echo "try a final listing"
   ls -lisa $s0_mnt $s1_mnt || return 21

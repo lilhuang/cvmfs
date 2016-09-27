@@ -15,7 +15,6 @@
 #include "manifest_fetch.h"
 #include "signature.h"
 #include "upload.h"
-#include "util.h"
 
 using namespace std;  // NOLINT
 using namespace swissknife;  // NOLINT
@@ -121,7 +120,7 @@ CommandTag::Environment* CommandTag::InitializeEnvironment(
 
   // initialize the (swissknife global) signature manager (if possible)
   if (!pubkey_path.empty() &&
-      !this->InitSignatureManager(pubkey_path, trusted_certs)) {
+      !this->InitVerifyingSignatureManager(pubkey_path, trusted_certs)) {
     return NULL;
   }
 

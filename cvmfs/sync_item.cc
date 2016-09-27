@@ -20,6 +20,7 @@ SyncItem::SyncItem() :
   whiteout_(false),
   opaque_(false),
   masked_hardlink_(false),
+  has_catalog_marker_(false),
   valid_graft_(false),
   graft_marker_present_(false),
   external_data_(false),
@@ -37,6 +38,7 @@ SyncItem::SyncItem(const string       &relative_parent_path,
   whiteout_(false),
   opaque_(false),
   masked_hardlink_(false),
+  has_catalog_marker_(false),
   valid_graft_(false),
   graft_marker_present_(false),
   external_data_(false),
@@ -49,8 +51,7 @@ SyncItem::SyncItem(const string       &relative_parent_path,
   compression_algorithm_(zlib::kZlibDefault)
 {
   content_hash_.algorithm = shash::kAny;
-  // Note: graft marker for non-regular files are silently ignored
-  if (IsRegularFile()) {CheckGraft();}
+  CheckMarkerFiles();
 }
 
 
@@ -170,7 +171,6 @@ catalog::DirectoryEntryBase SyncItem::CreateBasicCatalogDirent() const {
 
   // inode and parent inode is determined at runtime of client
   dirent.inode_          = catalog::DirectoryEntry::kInvalidInode;
-  dirent.parent_inode_   = catalog::DirectoryEntry::kInvalidInode;
 
   // this might mask the actual link count in case hardlinks are not supported
   // (i.e. on setups using OverlayFS)
@@ -217,6 +217,18 @@ std::string SyncItem::GetScratchPath() const {
   return union_engine_->scratch_path() + relative_path;
 }
 
+void SyncItem::CheckMarkerFiles() {
+  if (IsRegularFile()) {
+    CheckGraft();
+  } else if (IsDirectory()) {
+    CheckCatalogMarker();
+  }
+}
+
+void SyncItem::CheckCatalogMarker() {
+  has_catalog_marker_ = FileExists(GetUnionPath() + "/.cvmfscatalog");
+}
+
 
 std::string SyncItem::GetGraftMarkerPath() const {
   return union_engine_->scratch_path() + "/" +
@@ -236,7 +248,10 @@ void SyncItem::CheckGraft() {
            graftfile.c_str());
   FILE *fp = fopen(graftfile.c_str(), "r");
   if (fp == NULL) {
-    if (errno != ENOENT) {
+    // This sync item can be a file from a removed directory tree on overlayfs.
+    // In this case, the entire tree is missing on the scratch directory and
+    // the errno is ENOTDIR.
+    if ((errno != ENOENT) && (errno != ENOTDIR)) {
       LogCvmfs(kLogFsTraversal, kLogWarning, "Unable to open graft file "
                "(%s): %s (errno=%d)",
                graftfile.c_str(), strerror(errno), errno);

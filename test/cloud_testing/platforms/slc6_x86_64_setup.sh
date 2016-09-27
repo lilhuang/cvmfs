@@ -90,10 +90,24 @@ install_from_repo cmake         || die "fail (installing cmake)"
 install_from_repo libattr-devel || die "fail (installing libattr-devel)"
 
 # install test dependency for 600
-install_from_repo compat-expat1 || die "fail (installing compat-expat1)"
-install_from_repo openssl098e   || die "fail (installing openssl098e)"
-install_from_repo gridsite      || die "fail (installing gridsite)"
-install_from_repo voms          || die "fail (installing voms)"
+install_from_repo compat-expat1          || die "fail (installing compat-expat1)"
+install_from_repo openssl098e            || die "fail (installing openssl098e)"
+install_from_repo gridsite               || die "fail (installing gridsite)"
+install_from_repo voms                   || die "fail (installing voms)"
+install_from_repo globus-common          || die "fail (installing globus-common)"
+install_from_repo globus-gsi-callback    || die "fail (installing globus-gsi-callback)"
+install_from_repo globus-gsi-cert-utils  || die "fail (installing globus-gsi-cert-utils)"
+install_from_repo globus-gsi-credential  || die "fail (installing globus-gsi-credential)"
+install_from_repo globus-gsi-sysconfig   || die "fail (installing globus-gsi-sysconfig)"
+# TODO(jblomer): when we get support on more platforms, we might want to get the
+# helper package in a more general way than hard-coding it into the setup script
+x509_helper="https://ecsft.cern.ch/dist/cvmfs/cvmfs-x509-helper/cvmfs-x509-helper-0.9-1.el6.x86_64.rpm"
+echo -n "download X509 helper $x509_helper... "
+wget --no-check-certificate --quiet "$x509_helper" || die "download failed"
+echo "OK"
+echo -n "install x509 helper... "
+sudo rpm -ivh $(basename $x509_helper) > /dev/null || die "install failed"
+echo "OK"
 
 # install ruby gem for FakeS3
 install_ruby_gem fakes3 0.2.0  # latest is 0.2.1 (23.07.2015) that didn't work.

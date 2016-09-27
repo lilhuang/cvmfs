@@ -14,7 +14,7 @@
 
 #include "logging.h"
 #include "sanitizer.h"
-#include "util.h"
+#include "util/string.h"
 
 /**
  * This reads a mapping file of (roughly) the following format:
@@ -171,9 +171,8 @@ class IntegerMap {
   }
 
   void FilterEmptyStrings(std::vector<std::string> *vec) const {
-          std::vector<std::string>::iterator       i    = vec->begin();
-    const std::vector<std::string>::const_iterator iend = vec->end();
-    for (; i != iend ;) {
+    std::vector<std::string>::iterator i = vec->begin();
+    for (; i != vec->end(); ) {
       i = (i->empty()) ? vec->erase(i) : i + 1;
     }
   }

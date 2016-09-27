@@ -36,7 +36,7 @@
 #include "logging.h"
 #include "sanitizer.h"
 #include "smalloc.h"
-#include "util.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -164,6 +164,22 @@ string StripIp(const string &decorated_ip) {
     }
   }
   return decorated_ip;
+}
+
+
+/**
+ * Adds http:// if it is missing from proxy
+ */
+std::string AddDefaultScheme(const std::string &proxy) {
+  const bool ignore_case = true;
+  if (HasPrefix(proxy, "http://", ignore_case) ||
+      HasPrefix(proxy, "https://", ignore_case) ||
+      (proxy == "DIRECT") ||
+      proxy.empty())
+  {
+    return proxy;
+  }
+  return "http://" + proxy;
 }
 
 
@@ -681,6 +697,7 @@ CaresResolver::CaresResolver(
   const unsigned timeout_ms)
   : Resolver(ipv4_only, retries, timeout_ms)
   , channel_(NULL)
+  , lookup_options_(strdup("b"))
 {
 }
 
@@ -690,6 +707,7 @@ CaresResolver::~CaresResolver() {
     ares_destroy(*channel_);
     free(channel_);
   }
+  free(lookup_options_);
 }
 
 
@@ -719,7 +737,7 @@ CaresResolver *CaresResolver::Create(
   memset(&options, 0, sizeof(options));
   options.timeout = timeout_ms;
   options.tries = 1 + retries;
-  options.lookups = strdup("b");
+  options.lookups = resolver->lookup_options_;
   optmask = ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES | ARES_OPT_LOOKUPS;
   retval = ares_init_options(resolver->channel_, &options, optmask);
   if (retval != ARES_SUCCESS)

@@ -2,11 +2,14 @@
  * This file is part of the CernVM File System.
  */
 
+// TODO(jblomer): this unit test does not compile at the moment.  Re-enable
+// based on updated authz code.
+
 #include <gtest/gtest.h>
 
 // Single Authz test is static
 // TODO(jblomer): find a better solution than pulling in the .cc file
-#include "../../cvmfs/voms_authz/voms_authz.cc"  // NOLINT
+#include "authz/voms_authz.cc"  // NOLINT
 
 #define TEST_DN "/DC=ch/DC=cern/OU=Organic Units/OU=Users" \
                 "/CN=bbockelm/CN=659869/CN=Brian Paul Bockelman"
@@ -36,13 +39,13 @@ TEST(T_VOMS, VomsAuthz) {
   voms_entry.user = &user_dn[0];
   char voname[] = "cms";
   voms_entry.voname = voname;
-  std::vector<char> group1; group1.reserve(50);
+  char group1[50];
   strncpy(&group1[0], "/cms", 49);
-  std::vector<char> group2; group2.reserve(50);
+  char group2[50];
   strncpy(&group2[0], "/cms/uscms", 49);
-  std::vector<char> group3; group3.reserve(50);
+  char group3[50];
   strncpy(&group3[0], "/cms/escms", 49);
-  std::vector<char> role1; role1.reserve(50);
+  char role1[50];
   strncpy(&role1[0], "pilot", 49);
 
   voms_data[0].group = &group1[0];

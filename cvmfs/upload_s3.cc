@@ -5,6 +5,7 @@
 #include "upload_s3.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #ifdef _POSIX_PRIORITY_SCHEDULING
 #include <sched.h>
@@ -20,7 +21,8 @@
 #include "logging.h"
 #include "options.h"
 #include "s3fanout.h"
-#include "util.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 namespace upload {
 
@@ -276,6 +278,10 @@ int S3Uploader::GetKeysAndBucket(const std::string &filename,
  */
 std::string S3Uploader::GetBucketName(unsigned int use_bucket) const {
   std::stringstream ss;
+  if (number_of_buckets_ == 1 && keys_.size() == 1) {
+    ss << bucket_body_name_;
+    return ss.str();
+  }
   if (use_bucket >= static_cast<unsigned int>(number_of_buckets_)) {
     ss << bucket_body_name_ << "-1-1";
     return ss.str();

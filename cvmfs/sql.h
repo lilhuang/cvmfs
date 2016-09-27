@@ -5,12 +5,39 @@
 #ifndef CVMFS_SQL_H_
 #define CVMFS_SQL_H_
 
+#include <cassert>
 #include <string>
 
 #include "duplex_sqlite3.h"
-#include "util.h"
+#include "util/file_guard.h"
+#include "util/pointer.h"
 
 namespace sqlite {
+
+struct MemStatistics {
+  MemStatistics()
+    : lookaside_slots_used(-1)
+    , lookaside_slots_max(-1)
+    , lookaside_hit(-1)
+    , lookaside_miss_size(-1)
+    , lookaside_miss_full(-1)
+    , page_cache_used(-1)
+    , page_cache_hit(-1)
+    , page_cache_miss(-1)
+    , schema_used(-1)
+    , stmt_used(-1)
+  { }
+  int lookaside_slots_used;
+  int lookaside_slots_max;
+  int lookaside_hit;
+  int lookaside_miss_size;
+  int lookaside_miss_full;
+  int page_cache_used;   ///< Bytes used for caching pages
+  int page_cache_hit;
+  int page_cache_miss;
+  int schema_used;  ///< Bytes used to store db schema
+  int stmt_used;  ///< Bytes used for prepared statmements (lookaside + heap)
+};
 
 class Sql;
 
@@ -140,6 +167,11 @@ class Database : SingleCopy {
   double GetFreePageRatio() const;
 
   /**
+   * Retrieves the per-connection memory statistics from SQlite
+   */
+  void GetMemStatistics(MemStatistics *stats) const;
+
+  /**
    * Performs a VACUUM call on the opened database file to compacts the database.
    * As a first step it runs DerivedT::CompactDatabase() to allow for implement-
    * ation dependent cleanup actions. Vacuum() assumes that the SQLite database
@@ -221,6 +253,7 @@ class Database : SingleCopy {
     DatabaseRaiiWrapper(const std::string   &filename,
                         Database<DerivedT>  *delegate)
       : sqlite_db(NULL)
+      , lookaside_buffer(NULL)
       , db_file_guard(filename, UnlinkGuard::kDisabled)
       , delegate_(delegate) {}
     ~DatabaseRaiiWrapper();
@@ -228,11 +261,14 @@ class Database : SingleCopy {
     sqlite3*           database() const { return sqlite_db;            }
     const std::string& filename() const { return db_file_guard.path(); }
 
+    bool Close();
+
     void TakeFileOwnership() { db_file_guard.Enable();           }
     void DropFileOwnership() { db_file_guard.Disable();          }
     bool OwnsFile() const    { return db_file_guard.IsEnabled(); }
 
     sqlite3             *sqlite_db;
+    void                *lookaside_buffer;
     UnlinkGuard          db_file_guard;
     Database<DerivedT>  *delegate_;
   };
@@ -263,6 +299,23 @@ class Database : SingleCopy {
 /**
  * Base class for all SQL statement classes.  It wraps a single SQL statement
  * and all neccessary calls of the sqlite3 API to deal with this statement.
+ *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE  *
+ * NOTE   This base class implements a lazy initialization of the SQLite       *
+ * NOTE   prepared statement. Therefore it is strongly discouraged to use      *
+ * NOTE   any sqlite3_***() functions directly in the subclasses. Instead      *
+ * NOTE   one must wrap them in this base class and implement the lazy         *
+ * NOTE   initialization scheme as seen below.                                 *
+ * NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE NOTE  *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ *
+ * Derived classes can decide if their statement should be prepared immediately
+ * or on first use (aka lazily). The derived constructor must call Sql::Init()
+ * or Sql::DeferredInit() accordingly.
+ *
+ * Sql objects created via the public constructor rather than by the constructor
+ * of a derived class are prepared immediately by default.
  */
 class Sql {
  public:
@@ -291,28 +344,34 @@ class Sql {
   std::string GetLastErrorMsg() const;
 
   bool BindBlob(const int index, const void* value, const int size) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_blob(statement_, index, value, size,
                                          SQLITE_STATIC);
     return Successful();
   }
   bool BindBlobTransient(const int index, const void* value, const int size) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_blob(statement_, index, value, size,
                                          SQLITE_TRANSIENT);
     return Successful();
   }
   bool BindDouble(const int index, const double value) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_double(statement_, index, value);
     return Successful();
   }
   bool BindInt(const int index, const int value) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_int(statement_, index, value);
     return Successful();
   }
   bool BindInt64(const int index, const sqlite3_int64 value) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_int64(statement_, index, value);
     return Successful();
   }
   bool BindNull(const int index) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_null(statement_, index);
     return Successful();
   }
@@ -329,6 +388,7 @@ class Sql {
                 const char* value,
                 const int   size,
                 void(*dtor)(void*) = SQLITE_STATIC) {
+    LazyInit();
     last_error_code_ = sqlite3_bind_text(statement_, index, value, size, dtor);
     return Successful();
   }
@@ -381,8 +441,32 @@ class Sql {
   inline T Retrieve(const int index);
 
  protected:
-  Sql() : statement_(NULL), last_error_code_(0) { }
+  Sql()
+    : database_(NULL)
+    , statement_(NULL)
+    , query_string_(NULL)
+    , last_error_code_(0) { }
+
+  bool IsInitialized() const { return statement_ != NULL; }
+
+  /**
+   * Initializes the prepared statement immediately.
+   *
+   * @param database   the sqlite database pointer to be query against
+   * @param statement  the query string to be prepared for execution
+   * @return           true on successful statement preparation
+   */
   bool Init(const sqlite3 *database, const std::string &statement);
+
+  /**
+   * Defers the initialization of the prepared statement to the first usage to
+   * safe memory and CPU cycles for statements that are defined but never used.
+   * Typically this method is used in constructors of derived classes.
+   *
+   * @param database   the sqlite database pointer to be query against
+   * @param statement  the query string to be prepared for execution
+   */
+  void DeferredInit(const sqlite3 *database, const char *statement);
 
   /**
    * Checks the last action for success
@@ -394,8 +478,21 @@ class Sql {
            SQLITE_DONE == last_error_code_;
   }
 
-  sqlite3_stmt *statement_;
-  int last_error_code_;
+ private:
+  bool Init(const char *statement);
+  void LazyInit() {
+    if (!IsInitialized()) {
+      assert(NULL != database_);
+      assert(NULL != query_string_);
+      const bool success = Init(query_string_);
+      assert(success);
+    }
+  }
+
+  sqlite3       *database_;
+  sqlite3_stmt  *statement_;
+  const char    *query_string_;
+  int            last_error_code_;
 };
 
 }  // namespace sqlite

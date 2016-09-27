@@ -17,7 +17,7 @@
 #include "hash.h"
 #include "uid_map.h"
 #include "upload.h"
-#include "util.h"
+#include "util/algorithm.h"
 #include "util_concurrency.h"
 
 namespace catalog {
@@ -61,10 +61,11 @@ class CommandMigrate : public Command {
   struct PendingCatalog;
   typedef std::vector<PendingCatalog *> PendingCatalogList;
   struct PendingCatalog {
-    explicit PendingCatalog(const catalog::Catalog *old_catalog = NULL) :
-      success(false),
-      old_catalog(old_catalog),
-      new_catalog(NULL) { }
+    explicit PendingCatalog(const catalog::Catalog *old_catalog = NULL)
+      : success(false)
+      , old_catalog(old_catalog)
+      , new_catalog(NULL)
+      , new_catalog_size(0) { }
     virtual ~PendingCatalog();
 
     inline const std::string root_path() const {
@@ -129,6 +130,7 @@ class CommandMigrate : public Command {
     bool RunMigration(PendingCatalog *data) const { return false; }
 
     bool UpdateNestedCatalogReferences(PendingCatalog *data) const;
+    bool UpdateCatalogMetadata(PendingCatalog *data) const;
     bool CleanupNestedCatalogs(PendingCatalog *data) const;
     bool CollectAndAggregateStatistics(PendingCatalog *data) const;
 

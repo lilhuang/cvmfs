@@ -84,18 +84,19 @@ CVMFS_TEST_CLASS_NAME=ClientIntegrationTests                                  \
 
 
 echo "running CernVM-FS server test cases..."
+# TODO(jblomer): 551-openfds triggers an aufs panic
 CVMFS_TEST_SERVER_CACHE='/srv/cache/server'                                   \
 CVMFS_TEST_CLASS_NAME=ServerIntegrationTests                                  \
 ./run.sh $SERVER_TEST_LOGFILE -o ${SERVER_TEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
                               -x src/518-hardlinkstresstest                   \
                                  src/523-corruptchunkfailover                 \
                                  src/524-corruptmanifestfailover              \
-                                 src/577-garbagecollecthiddenstratum1revision \
-                                 src/579-garbagecollectstratum1legacytag      \
+                                 src/551-openfds                              \
                                  src/585-xattrs                               \
                                  src/600-securecvmfs                          \
                                  src/608-infofile                             \
                                  src/609-metainfofile                         \
+                                 src/628-pythonwrappedcvmfsserver             \
                                  --                                           \
                                  src/5*                                       \
                                  src/6*                                       \

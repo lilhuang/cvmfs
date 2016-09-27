@@ -12,11 +12,13 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <map>
 #include <string>
 
-#include "../../cvmfs/fs_traversal.h"
-#include "../../cvmfs/platform.h"
-#include "../../cvmfs/util.h"
+#include "fs_traversal.h"
+#include "platform.h"
+#include "util/file_guard.h"
+#include "util/posix.h"
 
 class T_FsTraversal : public ::testing::Test {
  public:
@@ -229,8 +231,9 @@ class T_FsTraversal : public ::testing::Test {
   void CreateSocket(const std::string &relative_path) {
     const std::string path = testbed_path_ + "/" + relative_path;
     const int retval = MakeSocket(path, 0755);
-    ASSERT_NE(-1, retval) << "errno: " << errno;
+    ASSERT_GE(retval, 0) << "errno: " << errno;
     reference_[relative_path] = Checklist(relative_path, Checklist::Socket);
+    close(retval);
   }
 
   void MakeFifo(const std::string &relative_path) {

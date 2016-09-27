@@ -35,6 +35,7 @@
 #include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -54,8 +55,9 @@
 #include "prng.h"
 #include "sanitizer.h"
 #include "smalloc.h"
-#include "util.h"
-#include "voms_authz/voms_authz.h"
+#include "util/algorithm.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -293,8 +295,8 @@ static size_t CallbackCurlData(void *ptr, size_t size, size_t nmemb,
     } else {
       int64_t written = info->destination_sink->Write(ptr, num_bytes);
       if ((written < 0) || (static_cast<uint64_t>(written) != num_bytes)) {
-        LogCvmfs(kLogDownload, kLogDebug, "Failed to perform write on path"
-                 " %s.", info->destination_path->c_str());
+        LogCvmfs(kLogDownload, kLogDebug, "Failed to perform write on %s (%"
+                 PRId64 ")", info->url->c_str(), written);
         info->error_code = kFailLocalIO;
         return 0;
       }
@@ -767,7 +769,6 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   info->curl_handle = handle;
   info->error_code = kFailOk;
   info->http_code = -1;
-  info->nocache = false;
   info->follow_redirects = follow_redirects_;
   info->num_used_proxies = 1;
   info->num_used_hosts = 1;
@@ -776,6 +777,11 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
   info->headers = header_lists_->DuplicateList(default_headers_);
   if (info->info_header) {
     header_lists_->AppendHeader(info->headers, info->info_header);
+  }
+  if (info->force_nocache) {
+    SetNocache(info);
+  } else {
+    info->nocache = false;
   }
   if (info->compressed) {
     zlib::DecompressInit(&(info->zstream));
@@ -794,9 +800,13 @@ void DownloadManager::InitializeRequest(JobInfo *info, CURL *handle) {
 
   if ((info->range_offset != -1) && (info->range_size)) {
     char byte_range_array[100];
-    if (snprintf(byte_range_array, sizeof(byte_range_array), "%ld-%ld",
-                 info->range_offset,
-                 info->range_offset + info->range_size - 1) == 100) {
+    const int64_t range_lower = static_cast<int64_t>(info->range_offset);
+    const int64_t range_upper = static_cast<int64_t>(
+      info->range_offset + info->range_size - 1);
+    if (snprintf(byte_range_array, sizeof(byte_range_array),
+                 "%" PRId64"-%" PRId64,
+                 range_lower, range_upper) == 100)
+    {
       abort();  // Should be impossible given limits on offset size.
     }
     curl_easy_setopt(handle, CURLOPT_RANGE, byte_range_array);
@@ -927,12 +937,18 @@ void DownloadManager::SetUrlOptions(JobInfo *info) {
     const char *cadir = getenv("X509_CERT_DIR");
     if (!cadir) {cadir = "/etc/grid-security/certificates";}
     curl_easy_setopt(curl_handle, CURLOPT_CAPATH, cadir);
-#ifdef VOMS_AUTHZ
     if (info->pid != -1) {
-      ConfigureCurlHandle(curl_handle, info->pid, info->uid, info->gid,
-                          &info->cred_fname, &info->cred_data);
+      if (credentials_attachment_ == NULL) {
+        LogCvmfs(kLogDownload, kLogDebug,
+                 "uses secure downloads but no credentials attachment set");
+      } else {
+        bool retval = credentials_attachment_->ConfigureCurlHandle(
+          curl_handle, info->pid, &info->cred_data);
+        if (!retval) {
+          LogCvmfs(kLogDownload, kLogDebug, "failed attaching credentials");
+        }
+      }
     }
-#endif
     // The download manager disables signal handling in the curl library;
     // as OpenSSL's implementation of TLS will generate a sigpipe in some
     // error paths, we must explicitly disable SIGPIPE here.
@@ -1098,6 +1114,16 @@ void DownloadManager::Backoff(JobInfo *info) {
 }
 
 
+void DownloadManager::SetNocache(JobInfo *info) {
+  if (info->nocache)
+    return;
+  header_lists_->AppendHeader(info->headers, "Pragma: no-cache");
+  header_lists_->AppendHeader(info->headers, "Cache-Control: no-cache");
+  curl_easy_setopt(info->curl_handle, CURLOPT_HTTPHEADER, info->headers);
+  info->nocache = true;
+}
+
+
 /**
  * Checks the result of a curl download and implements the failure logic, such
  * as changing the proxy server.  Takes care of cleanup.
@@ -1110,17 +1136,10 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
            info->url->c_str(), info->proxy.c_str(), curl_error);
   UpdateStatistics(info->curl_handle);
 
-  if (info->cred_fname) {
-    unlink(info->cred_fname);
-    free(info->cred_fname);
-    info->cred_fname = NULL;
-    curl_easy_setopt(info->curl_handle, CURLOPT_SSLCERT, NULL);
-    curl_easy_setopt(info->curl_handle, CURLOPT_SSLKEY, NULL);
-  }
   if (info->cred_data) {
-#ifdef VOMS_AUTHZ
-    ::ReleaseCurlHandle(info->curl_handle, info->cred_data);
-#endif
+    assert(credentials_attachment_ != NULL);  // Someone must have set it
+    credentials_attachment_->ReleaseCurlHandle(info->curl_handle,
+                                               info->cred_data);
     info->cred_data = NULL;
   }
 
@@ -1199,6 +1218,12 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     case CURLE_SSL_CACERT:
       LogCvmfs(kLogDownload, kLogDebug | kLogSyslogErr, "SSL certificate cannot"
                "be authenticated with known CA certificates. "
+               "X509_CERT_DIR might point to the wrong directory.");
+      info->error_code = kFailHostConnection;
+      break;
+    case CURLE_PEER_FAILED_VERIFICATION:
+      LogCvmfs(kLogDownload, kLogDebug | kLogSyslogErr,
+               "invalid SSL certificate of remote host. "
                "X509_CERT_DIR might point to the wrong directory.");
       info->error_code = kFailHostConnection;
       break;
@@ -1316,10 +1341,7 @@ bool DownloadManager::VerifyAndFinalize(const int curl_error, JobInfo *info) {
     bool switch_host = false;
     switch (info->error_code) {
       case kFailBadData:
-        header_lists_->AppendHeader(info->headers, "Pragma: no-cache");
-        header_lists_->AppendHeader(info->headers, "Cache-Control: no-cache");
-        curl_easy_setopt(info->curl_handle, CURLOPT_HTTPHEADER, info->headers);
-        info->nocache = true;
+        SetNocache(info);
         break;
       case kFailProxyResolve:
       case kFailProxyHttp:
@@ -1435,6 +1457,8 @@ DownloadManager::DownloadManager() {
   opt_proxy_groups_reset_after_ = 0;
   opt_timestamp_backup_host_ = 0;
   opt_host_reset_after_ = 0;
+
+  credentials_attachment_ = NULL;
 
   counters_ = NULL;
 }
@@ -1677,6 +1701,17 @@ Failures DownloadManager::Fetch(JobInfo *info) {
   }
 
   return result;
+}
+
+
+/**
+ * Used by the client to connect the authz session manager to the download
+ * manager.
+ */
+void DownloadManager::SetCredentialsAttachment(CredentialsAttachment *ca) {
+  pthread_mutex_lock(lock_options_);
+  credentials_attachment_ = ca;
+  pthread_mutex_unlock(lock_options_);
 }
 
 
@@ -2361,6 +2396,7 @@ void DownloadManager::SetProxyChain(
   for (unsigned i = 0; i < proxy_groups.size(); ++i) {
     vector<string> this_group = SplitString(proxy_groups[i], '|');
     for (unsigned j = 0; j < this_group.size(); ++j) {
+      this_group[j] = dns::AddDefaultScheme(this_group[j]);
       // Note: DIRECT strings will be "extracted" to an empty string.
       string hostname = dns::ExtractHost(this_group[j]);
       // Save the hostname.  Leave empty (DIRECT) names so indexes will
@@ -2385,6 +2421,7 @@ void DownloadManager::SetProxyChain(
     // objects, one for each IP address.
     vector<ProxyInfo> infos;
     for (unsigned j = 0; j < this_group.size(); ++j, ++num_proxy) {
+      this_group[j] = dns::AddDefaultScheme(this_group[j]);
       if (this_group[j] == "DIRECT") {
         infos.push_back(ProxyInfo("DIRECT"));
         continue;

@@ -16,7 +16,7 @@
 #include "hash.h"
 #include "logging.h"
 #include "manifest.h"
-#include "util.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -56,12 +56,15 @@ ParameterList CommandInfo::GetParams() {
   r.push_back(Parameter::Switch('v', "repository revision number"));
   r.push_back(Parameter::Switch('g', "check if repository is garbage "
                                         "collectable"));
+  r.push_back(Parameter::Switch('o', "check if the repository maintains a "
+                                     "reference log file"));
   r.push_back(Parameter::Switch('h', "print results in human readable form"));
   r.push_back(Parameter::Switch('L', "follow HTTP redirects"));
   r.push_back(Parameter::Switch('X', "show whether external data is supported "
                                         "in the root catalog."));
   r.push_back(Parameter::Switch('M', "print repository meta info."));
   r.push_back(Parameter::Switch('R', "print raw manifest."));
+  r.push_back(Parameter::Switch('e', "check if the repository is empty"));
   return r;
 }
 
@@ -87,19 +90,35 @@ int swissknife::CommandInfo::Main(const swissknife::ArgumentList &args) {
     return 1;
   }
 
+  if (IsRemote(repository)) {
+    const bool follow_redirects = args.count('L') > 0;
+    if (!this->InitDownloadManager(follow_redirects)) {
+      return 1;
+    }
+  }
+
+  // Check if we should be human readable
+  const bool human_readable = (args.count('h') > 0);
+
+  if (args.count('e') > 0) {
+    string manifest_path = IsRemote(repository) ?
+      ".cvmfspublished" : repository + "/.cvmfspublished";
+    bool is_empty = !Exists(repository, manifest_path);
+    LogCvmfs(kLogCvmfs, kLogStdout, "%s%s",
+             (human_readable) ? "Empty Repository:                " : "",
+             StringifyBool(is_empty).c_str());
+    if (is_empty)
+      return 0;
+  }
+
   // Load manifest file
   // Repository can be HTTP address or on local file system
   // TODO(jblomer): do this using Manifest::Fetch
   //       currently this is not possible, since Manifest::Fetch asks for the
   //       repository name... Which we want to figure out with the tool at hand.
   //       Possible Fix: Allow for a Manifest::Fetch with an empty name.
-  manifest::Manifest *manifest = NULL;
+  UniquePtr<manifest::Manifest> manifest;
   if (IsRemote(repository)) {
-    const bool follow_redirects = args.count('L') > 0;
-    if (!this->InitDownloadManager(follow_redirects)) {
-      return 1;
-    }
-
     const string url = repository + "/.cvmfspublished";
     download::JobInfo download_manifest(&url, false, false, NULL);
     download::Failures retval = download_manager()->Fetch(&download_manifest);
@@ -122,7 +141,7 @@ int swissknife::CommandInfo::Main(const swissknife::ArgumentList &args) {
     manifest = manifest::Manifest::LoadFile(".cvmfspublished");
   }
 
-  if (!manifest) {
+  if (!manifest.IsValid()) {
     LogCvmfs(kLogCvmfs, kLogStderr, "failed to load repository manifest");
     return 1;
   }
@@ -132,12 +151,8 @@ int swissknife::CommandInfo::Main(const swissknife::ArgumentList &args) {
   if (!Exists(repository, certificate_path)) {
     LogCvmfs(kLogCvmfs, kLogStderr, "failed to find certificate (%s)",
              certificate_path.c_str());
-    delete manifest;
     return 1;
   }
-
-  // Check if we should be human readable
-  const bool human_readable = (args.count('h') > 0);
 
   // Get information from the mount point
   if (args.count('C') > 0) {
@@ -218,6 +233,12 @@ int swissknife::CommandInfo::Main(const swissknife::ArgumentList &args) {
              (StringifyBool(manifest->garbage_collectable())).c_str());
   }
 
+  if (args.count('o') > 0) {
+    LogCvmfs(kLogCvmfs, kLogStdout, "%s%s",
+             (human_readable) ? "Maintains Reference Log:         " : "",
+             (Exists(repository, ".cvmfsreflog")) ? "true" : "false");
+  }
+
   if (args.count('M') > 0) {
     shash::Any meta_info(manifest->meta_info());
     if (meta_info.IsNull()) {
@@ -245,7 +266,6 @@ int swissknife::CommandInfo::Main(const swissknife::ArgumentList &args) {
              manifest->ExportString().c_str());
   }
 
-  delete manifest;
   return 0;
 }
 

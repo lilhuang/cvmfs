@@ -14,11 +14,11 @@ Vagrant.configure(2) do |config|
 
     # Give VM 1/4 system memory & access to all cpu cores on the host
     if host =~ /darwin/
-      cpus = `sysctl -n hw.ncpu`.to_i
+      cpus = [`sysctl -n hw.ncpu`.to_i / 2, 1].max
       # sysctl returns Bytes and we need to convert to MB
       mem = `sysctl -n hw.memsize`.to_i / 1024 / 1024 / 4
     elsif host =~ /linux/
-      cpus = `nproc`.to_i
+      cpus = [`nproc`.to_i / 2, 1].max
       # meminfo shows KB and we need to convert to MB
       mem = `grep 'MemTotal' /proc/meminfo | sed -e 's/MemTotal://' -e 's/ kB//'`.to_i / 1024 / 4
     else # sorry Windows folks, I can't help you
@@ -31,15 +31,15 @@ Vagrant.configure(2) do |config|
   end
 
   config.vm.define "cernvm" do |cvm|
-    cvm.vm.box = "cernvm"
-    # cvm.vm.box_url = ... TODO(reneme): maybe add later for convenience
+    cvm.vm.box = "cernvm36"
+    cvm.vm.box_url = "http://cernvm.cern.ch/releases/production/cernvm-3.6.5.box"
 
     cvm.vm.boot_timeout = 1200 # CernVM might load stuff over a slow network
                                   # and need a lot of time on first boot up
 
-    cvm.vm.network "private_network", ip: "192.168.33.10"
-
-    # cvm.vm.synced_folder '.', '/vagrant', nfs: true   TODO(reneme): quicker!
+    #cvm.vm.network "private_network", ip: "192.168.33.10"
+    cvm.vm.network "private_network", type: "dhcp", auto_config: false
+    cvm.vm.synced_folder '.', '/vagrant', nfs: true
 
     cvm.vm.provision "shell", path: "vagrant/provision_cernvm.sh"
   end
@@ -60,9 +60,16 @@ Vagrant.configure(2) do |config|
     slc6.vm.provision :reload
   end
 
-  config.vm.define "ubuntu" do |ub|
-    ub.vm.box = "ubuntu/wily64"
-    ub.vm.network "private_network", ip: "192.168.33.12"
+  config.vm.define "ubuntu1604" do |ub|
+    ub.vm.box = "ubuntu/xenial64"
+    ub.vm.network "private_network", ip: "192.168.33.15"
+    ub.vm.synced_folder '.', '/vagrant', nfs: true
+    ub.vm.provision "shell", path: "vagrant/provision_ubuntu.sh"
+  end
+
+  config.vm.define "ubuntu1204" do |ub|
+    ub.vm.box = "ubuntu/precise64"
+    ub.vm.network "private_network", ip: "192.168.33.16"
     ub.vm.synced_folder '.', '/vagrant', nfs: true
     ub.vm.provision "shell", path: "vagrant/provision_ubuntu.sh"
   end
@@ -72,5 +79,12 @@ Vagrant.configure(2) do |config|
     fedora.vm.network "private_network", ip: "192.168.33.13"
     fedora.vm.synced_folder '.', '/vagrant', nfs: true
     fedora.vm.provision "shell", path: "vagrant/provision_fedora.sh"
+  end
+
+  config.vm.define "centos7" do |centos7|
+    centos7.vm.box = "geerlingguy/centos7"
+    centos7.vm.network "private_network", ip: "192.168.33.14"
+    centos7.vm.synced_folder '.', '/vagrant', nfs: true
+    centos7.vm.provision "shell", path: "vagrant/provision_centos7.sh"
   end
 end

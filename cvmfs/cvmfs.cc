@@ -69,6 +69,9 @@
 #include <vector>
 
 #include "atomic.h"
+#include "authz/authz_curl.h"
+#include "authz/authz_fetch.h"
+#include "authz/authz_session.h"
 #include "auto_umount.h"
 #include "backoff.h"
 #include "cache.h"
@@ -79,6 +82,7 @@
 #include "directory_entry.h"
 #include "download.h"
 #include "duplex_sqlite3.h"
+#include "fence.h"
 #include "fetch.h"
 #include "file_chunk.h"
 #include "globals.h"
@@ -98,18 +102,15 @@
 #include "shortstring.h"
 #include "signature.h"
 #include "smalloc.h"
+#include "sqlitemem.h"
 #include "sqlitevfs.h"
 #include "statistics.h"
 #include "talk.h"
 #include "tracer.h"
-#include "util.h"
 #include "util_concurrency.h"
 #include "uuid.h"
-#include "voms_authz/voms_cred.h"
 #include "wpad.h"
 #include "xattr.h"
-
-#include "voms_authz/voms_authz.h"
 
 #ifdef FUSE_CAP_EXPORT_SUPPORT
 #define CVMFS_NFS_SUPPORT
@@ -195,6 +196,9 @@ quota::ListenerHandle *unpin_listener_ = NULL;
 signature::SignatureManager *signature_manager_ = NULL;
 download::DownloadManager *download_manager_ = NULL;
 download::DownloadManager *external_download_manager_ = NULL;
+AuthzExternalFetcher *authz_fetcher_ = NULL;
+AuthzSessionManager *authz_session_manager_ = NULL;
+AuthzAttachment *authz_attachment_ = NULL;
 cache::CacheManager *cache_manager_ = NULL;
 Fetcher *fetcher_ = NULL;
 Fetcher *external_fetcher_ = NULL;
@@ -270,36 +274,7 @@ const int kNumReservedFd = 512;
  * Ensures that within a callback all operations take place on the same
  * catalog revision.
  */
-class RemountFence : public SingleCopy {
- public:
-  RemountFence() {
-    atomic_init64(&counter_);
-    atomic_init32(&blocking_);
-  }
-  void Enter() {
-    while (atomic_read32(&blocking_)) {
-      SafeSleepMs(100);
-    }
-    atomic_inc64(&counter_);
-  }
-  void Leave() {
-    atomic_dec64(&counter_);
-  }
-  void Block() {
-    atomic_cas32(&blocking_, 0, 1);
-    while (atomic_read64(&counter_) > 0) {
-      SafeSleepMs(100);
-    }
-  }
-  void Unblock() {
-    atomic_cas32(&blocking_, 1, 0);
-  }
-
- private:
-  atomic_int64 counter_;
-  atomic_int32 blocking_;
-};
-RemountFence *remount_fence_;
+Fence *fence_remount_;
 
 
 /**
@@ -377,6 +352,17 @@ static bool UseWatchdog() {
 }
 
 
+std::string PrintInodeGeneration() {
+  return "init-catalog-revision: " +
+    StringifyInt(inode_generation_info_.initial_revision) + "  " +
+    "current-catalog-revision: " +
+    StringifyInt(catalog_manager_->GetRevision()) + "  " +
+    "incarnation: " + StringifyInt(inode_generation_info_.incarnation) + "  " +
+    "inode generation: " + StringifyInt(inode_generation_info_.inode_generation)
+    + "\n";
+}
+
+
 static void AlarmReload(int signal __attribute__((unused)),
                         siginfo_t *siginfo __attribute__((unused)),
                         void *context __attribute__((unused)))
@@ -434,7 +420,7 @@ static void RemountFinish() {
     md5path_cache_->Drop();
 
     // Ensure that all Fuse callbacks left the catalog query code
-    remount_fence_->Block();
+    fence_remount_->Drain();
     catalog::LoadError retval = catalog_manager_->Remount(false);
     if (inode_annotation_) {
       inode_generation_info_.inode_generation =
@@ -442,7 +428,8 @@ static void RemountFinish() {
     }
     volatile_repository_ = catalog_manager_->GetVolatileFlag();
     has_voms_authz_ = catalog_manager_->GetVOMSAuthz(voms_authz_);
-    remount_fence_->Unblock();
+    authz_attachment_->set_membership(*voms_authz_);
+    fence_remount_->Open();
 
     inode_cache_->Resume();
     path_cache_->Resume();
@@ -497,23 +484,15 @@ static void RemountCheck() {
 
 
 static bool CheckVoms(const fuse_ctx &fctx) {
-  if (has_voms_authz_) {
-    LogCvmfs(kLogCvmfs, kLogDebug, "Got VOMS authz %s from filesystem "
-             "properties", voms_authz_->c_str());
-  }
+  if (!has_voms_authz_)
+    return true;
+  LogCvmfs(kLogCvmfs, kLogDebug, "Got VOMS authz %s from filesystem "
+           "properties", voms_authz_->c_str());
 
-  // Get VOMS information, if any.  If VOMS authz is present and VOMS is
-  // not compiled in, then deny authorization.
-  if ((fctx.uid != 0) && voms_authz_->size()) {
-#ifdef VOMS_AUTHZ
-    return CheckVOMSAuthz(&fctx, *voms_authz_);
-#else
-    LogCvmfs(kLogCvmfs, kLogSyslogWarn | kLogDebug,  "VOMS requirements found "
-              "in catalog but client compiled without VOMS support");
-    return false;
-#endif
-  }
-  return true;
+  if (fctx.uid == 0)
+    return true;
+
+  return authz_session_manager_->IsMemberOf(fctx.pid, *voms_authz_);
 }
 
 // TODO(jblomer): the remount functions need to move into a separate entity
@@ -574,7 +553,9 @@ static bool GetDirentForInode(const fuse_ino_t ino,
   // Non-NFS mode
   PathString path;
   if (ino == catalog_manager_->GetRootInode()) {
-    catalog_manager_->LookupPath(PathString(), catalog::kLookupSole, dirent);
+    bool retval =
+      catalog_manager_->LookupPath(PathString(), catalog::kLookupSole, dirent);
+    assert(retval);
     dirent->set_inode(ino);
     inode_cache_->Insert(ino, *dirent);
     return true;
@@ -583,7 +564,8 @@ static bool GetDirentForInode(const fuse_ino_t ino,
   bool retval = inode_tracker_->FindPath(ino, &path);
   if (!retval) {
     // Can this ever happen?
-    LogCvmfs(kLogCvmfs, kLogDebug, "GetDirentForInode inode lookup failure");
+    LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogErr,
+             "GetDirentForInode inode lookup failure %" PRId64, ino);
     *dirent = dirent_negative;
     return false;
   }
@@ -677,7 +659,7 @@ static void cvmfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
   RemountCheck();
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   parent = catalog_manager_->MangleInode(parent);
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_lookup in parent inode: %"PRIu64" for name: %s",
@@ -737,21 +719,21 @@ static void cvmfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
  lookup_reply_positive:
   if (!nfs_maps_)
     inode_tracker_->VfsGet(dirent.inode(), path);
-  remount_fence_->Leave();
+  fence_remount_->Leave();
   result.ino = dirent.inode();
   result.attr = dirent.GetStatStructure();
   fuse_reply_entry(req, &result);
   return;
 
  lookup_reply_negative:
-  remount_fence_->Leave();
+  fence_remount_->Leave();
   perf::Inc(n_fs_lookup_negative_);
   result.ino = 0;
   fuse_reply_entry(req, &result);
   return;
 
  lookup_reply_error:
-  remount_fence_->Leave();
+  fence_remount_->Leave();
   fuse_reply_err(req, EIO);
 }
 
@@ -772,13 +754,15 @@ static void cvmfs_forget(
     return;
   }
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
+  // This has been seen to deadlock on the debug log mutex on SL5.  Problem of
+  // old kernel/fuse?
   LogCvmfs(kLogCvmfs, kLogDebug, "forget on inode %"PRIu64" by %u",
            uint64_t(ino), nlookup);
   if (!nfs_maps_)
     inode_tracker_->VfsPut(ino, nlookup);
-  remount_fence_->Leave();
+  fence_remount_->Leave();
   fuse_reply_none(req);
 }
 
@@ -808,20 +792,20 @@ static void cvmfs_getattr(fuse_req_t req, fuse_ino_t ino,
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
   RemountCheck();
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug, "cvmfs_getattr (stat) for inode: %"PRIu64,
            uint64_t(ino));
 
   if (!CheckVoms(*fuse_ctx)) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, EACCES);
     return;
   }
 
   catalog::DirectoryEntry dirent;
   const bool found = GetDirentForInode(ino, &dirent);
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   if (!found) {
     ReplyNegative(dirent, req);
@@ -842,14 +826,14 @@ static void cvmfs_readlink(fuse_req_t req, fuse_ino_t ino) {
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug, "cvmfs_readlink on inode: %"PRIu64,
            uint64_t(ino));
 
   catalog::DirectoryEntry dirent;
   const bool found = GetDirentForInode(ino, &dirent);
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   if (!found) {
     ReplyNegative(dirent, req);
@@ -899,13 +883,13 @@ static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
   RemountCheck();
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug, "cvmfs_opendir on inode: %"PRIu64,
            uint64_t(ino));
 
   if (!CheckVoms(*fuse_ctx)) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, EACCES);
     return;
   }
@@ -914,19 +898,19 @@ static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
   catalog::DirectoryEntry d;
   bool found = GetPathForInode(ino, &path);
   if (!found) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, ENOENT);
     return;
   }
   found = GetDirentForInode(ino, &d);
 
   if (!found) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     ReplyNegative(d, req);
     return;
   }
   if (!d.IsDirectory()) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, ENOTDIR);
     return;
   }
@@ -956,7 +940,7 @@ static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
   bool retval = catalog_manager_->ListingStat(path, &listing_from_catalog);
 
   if (!retval) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_listing.Clear();  // Buffer is shared, empty manually
     fuse_reply_err(req, EIO);
     return;
@@ -981,7 +965,7 @@ static void cvmfs_opendir(fuse_req_t req, fuse_ino_t ino,
     AddToDirListing(req, listing_from_catalog.AtPtr(i)->name.c_str(),
                     &fixed_info, &fuse_listing);
   }
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   DirectoryListing stream_listing;
   stream_listing.size = fuse_listing.size();
@@ -1094,7 +1078,7 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
 {
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug, "cvmfs_open on inode: %"PRIu64, uint64_t(ino));
 
@@ -1104,19 +1088,19 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
 
   bool found = GetPathForInode(ino, &path);
   if (!found) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, ENOENT);
     return;
   }
   found = GetDirentForInode(ino, &dirent);
   if (!found) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     ReplyNegative(dirent, req);
     return;
   }
 
   if (!CheckVoms(*fuse_ctx)) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, EACCES);
     return;
   }
@@ -1129,13 +1113,13 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
   // }
 #ifdef __APPLE__
   if ((fi->flags & O_SHLOCK) || (fi->flags & O_EXLOCK)) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, EOPNOTSUPP);
     return;
   }
 #endif
   if (fi->flags & O_EXCL) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, EEXIST);
     return;
   }
@@ -1143,7 +1127,7 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
   perf::Inc(n_fs_open_);  // Count actual open / fetch operations
 
   if (!dirent.IsChunkedFile()) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
   } else {
     LogCvmfs(kLogCvmfs, kLogDebug,
              "chunked file %s opened (download delayed to read() call)",
@@ -1153,56 +1137,76 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
         (static_cast<int>(max_open_files_))-kNumReservedFd)
     {
       perf::Dec(no_open_files_);
-      remount_fence_->Leave();
+      fence_remount_->Leave();
       LogCvmfs(kLogCvmfs, kLogSyslogErr, "open file descriptor limit exceeded");
       fuse_reply_err(req, EMFILE);
       return;
     }
 
+    // Figure out unique inode from annotated catalog
+    catalog::DirectoryEntry dirent_origin;
+    if (!catalog_manager_->LookupPath(path, catalog::kLookupSole,
+                                      &dirent_origin))
+    {
+      fence_remount_->Leave();
+      LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogErr,
+               "chunked file %s vanished unexpectedly", path.c_str());
+      fuse_reply_err(req, ENOENT);
+      return;
+    }
+    const uint64_t unique_inode = dirent_origin.inode();
+
     chunk_tables_->Lock();
-    if (!chunk_tables_->inode2chunks.Contains(ino)) {
+    if (!chunk_tables_->inode2chunks.Contains(unique_inode)) {
       chunk_tables_->Unlock();
 
       // Retrieve File chunks from the catalog
-      FileChunkList *chunks = new FileChunkList();
+      UniquePtr<FileChunkList> chunks(new FileChunkList());
       if (!catalog_manager_->ListFileChunks(path, dirent.hash_algorithm(),
-                                           chunks) ||
+                                            chunks.weak_ref()) ||
           chunks->IsEmpty())
       {
-        remount_fence_->Leave();
+        fence_remount_->Leave();
         LogCvmfs(kLogCvmfs, kLogDebug| kLogSyslogErr, "file %s is marked as "
                  "'chunked', but no chunks found.", path.c_str());
         fuse_reply_err(req, EIO);
         return;
       }
-      remount_fence_->Leave();
+      fence_remount_->Leave();
 
       chunk_tables_->Lock();
       // Check again to avoid race
-      if (!chunk_tables_->inode2chunks.Contains(ino)) {
+      if (!chunk_tables_->inode2chunks.Contains(unique_inode)) {
         chunk_tables_->inode2chunks.Insert(
-          ino, FileChunkReflist(chunks, path, dirent.compression_algorithm(),
-                                dirent.IsExternalFile()));
-        chunk_tables_->inode2references.Insert(ino, 1);
+          unique_inode, FileChunkReflist(chunks.Release(), path,
+                                         dirent.compression_algorithm(),
+                                         dirent.IsExternalFile()));
+        chunk_tables_->inode2references.Insert(unique_inode, 1);
       } else {
         uint32_t refctr;
-        bool retval = chunk_tables_->inode2references.Lookup(ino, &refctr);
+        bool retval =
+          chunk_tables_->inode2references.Lookup(unique_inode, &refctr);
         assert(retval);
-        chunk_tables_->inode2references.Insert(ino, refctr+1);
+        chunk_tables_->inode2references.Insert(unique_inode, refctr+1);
       }
     } else {
-      remount_fence_->Leave();
+      fence_remount_->Leave();
       uint32_t refctr;
-      bool retval = chunk_tables_->inode2references.Lookup(ino, &refctr);
+      bool retval =
+        chunk_tables_->inode2references.Lookup(unique_inode, &refctr);
       assert(retval);
-      chunk_tables_->inode2references.Insert(ino, refctr+1);
+      chunk_tables_->inode2references.Insert(unique_inode, refctr+1);
     }
 
     // Update the chunk handle list
     LogCvmfs(kLogCvmfs, kLogDebug,
-             "linking chunk handle %d to inode: %"PRIu64,
-             chunk_tables_->next_handle, uint64_t(ino));
+             "linking chunk handle %d to unique inode: %" PRIu64,
+             chunk_tables_->next_handle, uint64_t(unique_inode));
     chunk_tables_->handle2fd.Insert(chunk_tables_->next_handle, ChunkFd());
+    chunk_tables_->handle2uniqino.Insert(chunk_tables_->next_handle,
+                                         unique_inode);
+    // The same inode can refer to different revisions of a path.  Don't cache.
+    fi->keep_cache = 0;
     fi->fh = static_cast<uint64_t>(-chunk_tables_->next_handle);
     ++chunk_tables_->next_handle;
     chunk_tables_->Unlock();
@@ -1224,15 +1228,7 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
         (static_cast<int>(max_open_files_))-kNumReservedFd) {
       LogCvmfs(kLogCvmfs, kLogDebug, "file %s opened (fd %d)",
                path.c_str(), fd);
-      /*fi->keep_cache = kcache_timeout_ == 0.0 ? 0 : 1;
-      if (dirent.cached_mtime() != dirent.mtime()) {
-        LogCvmfs(kLogCvmfs, kLogDebug,
-                 "file might be new or changed, invalidating cache (%d %d "
-                 "%"PRIu64")", dirent.mtime(), dirent.cached_mtime(), uint64_t(ino));
-        fi->keep_cache = 0;
-        dirent.set_cached_mtime(dirent.mtime());
-        inode_cache_->Insert(ino, dirent);
-      }*/
+      // The same inode can refer to different revisions of a path. Don't cache.
       fi->keep_cache = 0;
       fi->fh = fd;
       fuse_reply_open(req, fi);
@@ -1284,13 +1280,19 @@ static void cvmfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
     const uint64_t chunk_handle =
       static_cast<uint64_t>(-static_cast<int64_t>(fi->fh));
+    uint64_t unique_inode;
     ChunkFd chunk_fd;
     FileChunkReflist chunks;
     bool retval;
 
-    // Fetch chunk list and file descriptor
+    // Fetch unique inode, chunk list and file descriptor
     chunk_tables_->Lock();
-    retval = chunk_tables_->inode2chunks.Lookup(ino, &chunks);
+    retval = chunk_tables_->handle2uniqino.Lookup(chunk_handle, &unique_inode);
+    if (!retval) {
+      LogCvmfs(kLogCvmfs, kLogDebug, "no unique inode, fall back to fuse ino");
+      unique_inode = ino;
+    }
+    retval = chunk_tables_->inode2chunks.Lookup(unique_inode, &chunks);
     assert(retval);
     chunk_tables_->Unlock();
 
@@ -1415,30 +1417,38 @@ static void cvmfs_release(fuse_req_t req, fuse_ino_t ino,
       static_cast<uint64_t>(-static_cast<int64_t>(fi->fh));
     LogCvmfs(kLogCvmfs, kLogDebug, "releasing chunk handle %"PRIu64,
              chunk_handle);
+    uint64_t unique_inode;
     ChunkFd chunk_fd;
     FileChunkReflist chunks;
     uint32_t refctr;
     bool retval;
 
     chunk_tables_->Lock();
+    retval = chunk_tables_->handle2uniqino.Lookup(chunk_handle, &unique_inode);
+    if (!retval) {
+      LogCvmfs(kLogCvmfs, kLogDebug, "no unique inode, fall back to fuse ino");
+      unique_inode = ino;
+    } else {
+      chunk_tables_->handle2uniqino.Erase(chunk_handle);
+    }
     retval = chunk_tables_->handle2fd.Lookup(chunk_handle, &chunk_fd);
     assert(retval);
     chunk_tables_->handle2fd.Erase(chunk_handle);
 
-    retval = chunk_tables_->inode2references.Lookup(ino, &refctr);
+    retval = chunk_tables_->inode2references.Lookup(unique_inode, &refctr);
     assert(retval);
     refctr--;
     if (refctr == 0) {
       LogCvmfs(kLogCvmfs, kLogDebug, "releasing chunk list for inode %"PRIu64,
-               uint64_t(ino));
+               uint64_t(unique_inode));
       FileChunkReflist to_delete;
-      retval = chunk_tables_->inode2chunks.Lookup(ino, &to_delete);
+      retval = chunk_tables_->inode2chunks.Lookup(unique_inode, &to_delete);
       assert(retval);
-      chunk_tables_->inode2references.Erase(ino);
-      chunk_tables_->inode2chunks.Erase(ino);
+      chunk_tables_->inode2references.Erase(unique_inode);
+      chunk_tables_->inode2chunks.Erase(unique_inode);
       delete to_delete.list;
     } else {
-      chunk_tables_->inode2references.Insert(ino, refctr);
+      chunk_tables_->inode2references.Insert(unique_inode, refctr);
     }
     chunk_tables_->Unlock();
 
@@ -1491,11 +1501,11 @@ static void cvmfs_statfs(fuse_req_t req, fuse_ino_t ino) {
   info.f_bfree = info.f_bavail = available;
 
   // Inodes / entries
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   info.f_files = catalog_manager_->all_inodes();
   info.f_ffree = info.f_favail =
     catalog_manager_->all_inodes() - catalog_manager_->loaded_inodes();
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   fuse_reply_statfs(req, &info);
 }
@@ -1512,14 +1522,14 @@ static void cvmfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_getxattr on inode: %"PRIu64" for xattr: %s",
            uint64_t(ino), name);
 
   if (!CheckVoms(*fuse_ctx)) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     fuse_reply_err(req, EACCES);
     return;
   }
@@ -1546,7 +1556,7 @@ static void cvmfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
     assert(retval);
     d.set_symlink(raw_symlink.symlink());
   }
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   if (!found) {
     ReplyNegative(d, req);
@@ -1775,7 +1785,7 @@ static void cvmfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
   const struct fuse_ctx *fuse_ctx = fuse_req_ctx(req);
   ClientCtxGuard ctx_guard(fuse_ctx->uid, fuse_ctx->gid, fuse_ctx->pid);
 
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   ino = catalog_manager_->MangleInode(ino);
   LogCvmfs(kLogCvmfs, kLogDebug,
            "cvmfs_listxattr on inode: %"PRIu64", size %u [hide xattrs %d]",
@@ -1791,7 +1801,7 @@ static void cvmfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
     retval = catalog_manager_->LookupXattrs(path, &xattrs);
     assert(retval);
   }
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   if (!found) {
     ReplyNegative(d, req);
@@ -1845,9 +1855,9 @@ static void cvmfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) {
 
 bool Evict(const string &path) {
   catalog::DirectoryEntry dirent;
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   const bool found = GetDirentForPath(PathString(path), &dirent);
-  remount_fence_->Leave();
+  fence_remount_->Leave();
 
   if (!found || !dirent.IsRegular())
     return false;
@@ -1858,20 +1868,20 @@ bool Evict(const string &path) {
 
 bool Pin(const string &path) {
   catalog::DirectoryEntry dirent;
-  remount_fence_->Enter();
+  fence_remount_->Enter();
   const bool found = GetDirentForPath(PathString(path), &dirent);
   if (!found || !dirent.IsRegular()) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     return false;
   }
 
   if (!dirent.IsChunkedFile()) {
-    remount_fence_->Leave();
+    fence_remount_->Leave();
   } else {
     FileChunkList chunks;
     catalog_manager_->ListFileChunks(PathString(path), dirent.hash_algorithm(),
                                      &chunks);
-    remount_fence_->Leave();
+    fence_remount_->Leave();
     for (unsigned i = 0; i < chunks.size(); ++i) {
       bool retval =
         cache_manager_->quota_mgr()->Pin(
@@ -1989,8 +1999,6 @@ bool g_talk_ready = false;
 bool g_running_created = false;
 
 int g_fd_lockfile = -1;
-void *g_sqlite_scratch = NULL;
-void *g_sqlite_page_cache = NULL;
 string *g_boot_error = NULL;
 
 __attribute__((visibility("default")))
@@ -2067,6 +2075,8 @@ static int Init(const loader::LoaderExports *loader_exports) {
   string nfs_shared_dir = string(cvmfs::kDefaultCachedir);
   bool shared_cache = false;
   int64_t quota_limit = cvmfs::kDefaultCacheSizeMb;
+  string authz_helper = "";
+  string authz_search_path = "/usr/libexec/cvmfs/authz";
   string hostname = "";
   string proxies = "";
   string fallback_proxies = "";
@@ -2131,6 +2141,10 @@ static int Init(const loader::LoaderExports *loader_exports) {
   // Overwrite default options
   if (cvmfs::options_manager_->GetValue("CVMFS_MEMCACHE_SIZE", &parameter))
     mem_cache_size = String2Uint64(parameter) * 1024*1024;
+  if (cvmfs::options_manager_->GetValue("CVMFS_AUTHZ_HELPER", &parameter))
+    authz_helper = parameter;
+  if (cvmfs::options_manager_->GetValue("CVMFS_AUTHZ_SEARCH_PATH", &parameter))
+    authz_search_path = parameter;
   if (cvmfs::options_manager_->GetValue("CVMFS_TIMEOUT", &parameter))
     timeout = String2Uint64(parameter);
   if (cvmfs::options_manager_->GetValue("CVMFS_TIMEOUT_DIRECT", &parameter))
@@ -2200,8 +2214,6 @@ static int Init(const loader::LoaderExports *loader_exports) {
   if (cvmfs::options_manager_->GetValue("CVMFS_EXTERNAL_FALLBACK_PROXY",
       &parameter))
     fallback_external_proxies = parameter;
-  else
-    fallback_external_proxies = fallback_proxies;
   if (cvmfs::options_manager_->GetValue("CVMFS_DNS_SERVER", &parameter))
     dns_server = parameter;
   if (cvmfs::options_manager_->GetValue("CVMFS_EXTERNAL_URL", &parameter)) {
@@ -2350,17 +2362,7 @@ static int Init(const loader::LoaderExports *loader_exports) {
   assert(retval == SQLITE_OK);
   retval = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
   assert(retval == SQLITE_OK);
-  // 8 KB for 8 threads (2 slots per thread)
-  g_sqlite_scratch = smalloc(8192*16);
-  g_sqlite_page_cache = smalloc(1280*3275);  // 4MB
-  retval = sqlite3_config(SQLITE_CONFIG_SCRATCH, g_sqlite_scratch, 8192, 16);
-  assert(retval == SQLITE_OK);
-  retval = sqlite3_config(SQLITE_CONFIG_PAGECACHE, g_sqlite_page_cache,
-                          1280, 3275);
-  assert(retval == SQLITE_OK);
-  // 4 KB
-  retval = sqlite3_config(SQLITE_CONFIG_LOOKASIDE, 32, 128);
-  assert(retval == SQLITE_OK);
+  SqliteMemoryManager::GetInstance()->AssignGlobalArenas();
 
   // Disable SQlite3 locks
   retval = sqlite3_vfs_register(sqlite3_vfs_find("unix-none"), 1);
@@ -2598,10 +2600,23 @@ static int Init(const loader::LoaderExports *loader_exports) {
     return loader::kFailCacheDir;
   }
 
+  // Credentials store
+  cvmfs::authz_fetcher_ = new AuthzExternalFetcher(
+    *cvmfs::repository_name_,
+    authz_helper,
+    authz_search_path,
+    cvmfs::options_manager_);
+  cvmfs::authz_session_manager_ = AuthzSessionManager::Create(
+    cvmfs::authz_fetcher_,
+    cvmfs::statistics_);
+  assert(cvmfs::authz_session_manager_ != NULL);
+  cvmfs::authz_attachment_ = new AuthzAttachment(cvmfs::authz_session_manager_);
+
   // Network initialization
   cvmfs::download_manager_ = new download::DownloadManager();
   cvmfs::download_manager_->Init(cvmfs::kDefaultNumConnections, false,
       cvmfs::statistics_);
+  cvmfs::download_manager_->SetCredentialsAttachment(cvmfs::authz_attachment_);
   cvmfs::download_manager_->SetHostChain(hostname);
   if ((dns_timeout_ms != download::DownloadManager::kDnsDefaultTimeoutMs) ||
       (dns_retries != download::DownloadManager::kDnsDefaultRetries))
@@ -2639,6 +2654,7 @@ static int Init(const loader::LoaderExports *loader_exports) {
                                               cvmfs::download_manager_);
   if (proxies == "") {
     *g_boot_error = "failed to discover HTTP proxy servers";
+    delete uuid;
     return loader::kFailWpad;
   }
   cvmfs::download_manager_->SetProxyChain(
@@ -2653,7 +2669,8 @@ static int Init(const loader::LoaderExports *loader_exports) {
   cvmfs::external_download_manager_ = new download::DownloadManager();
   cvmfs::external_download_manager_->Init(cvmfs::kDefaultNumConnections, false,
       cvmfs::statistics_, "download-external");
-
+  cvmfs::external_download_manager_->SetCredentialsAttachment(
+    cvmfs::authz_attachment_);
   cvmfs::external_download_manager_->SetHostChain(!external_host.empty() ?
                                                   external_host : hostname);
   if ((dns_timeout_ms != download::DownloadManager::kDnsDefaultTimeoutMs) ||
@@ -2885,13 +2902,14 @@ static int Init(const loader::LoaderExports *loader_exports) {
   cvmfs::voms_authz_ = new string();
   cvmfs::has_voms_authz_ =
     cvmfs::catalog_manager_->GetVOMSAuthz(cvmfs::voms_authz_);
+  cvmfs::authz_attachment_->set_membership(*cvmfs::voms_authz_);
 
   // Make sure client context TLS has been initialized
   // (first initialization is not thread safe).
   ClientCtx::GetInstance();
 
   cvmfs::pipe_remount_trigger_[0] = cvmfs::pipe_remount_trigger_[1] = -1;
-  cvmfs::remount_fence_ = new cvmfs::RemountFence();
+  cvmfs::fence_remount_ = new Fence();
   auto_umount::SetMountpoint(*cvmfs::mountpoint_);
 
   return loader::kFailOk;
@@ -3006,6 +3024,10 @@ static void Fini() {
     delete cvmfs::fetcher_;
     cvmfs::fetcher_ = NULL;
   }
+  if (cvmfs::external_fetcher_) {
+    delete cvmfs::external_fetcher_;
+    cvmfs::external_fetcher_ = NULL;
+  }
 
   tracer::Fini();
   if (g_signature_ready) cvmfs::signature_manager_->Fini();
@@ -3024,10 +3046,13 @@ static void Fini() {
     cvmfs::options_manager_ = NULL;
   }
 
-  delete cvmfs::remount_fence_;
+  delete cvmfs::fence_remount_;
   delete cvmfs::signature_manager_;
   delete cvmfs::download_manager_;
   delete cvmfs::external_download_manager_;
+  delete cvmfs::authz_attachment_;
+  delete cvmfs::authz_session_manager_;
+  delete cvmfs::authz_fetcher_;
   delete cvmfs::inode_annotation_;
   delete cvmfs::directory_handles_;
   delete cvmfs::chunk_tables_;
@@ -3042,10 +3067,13 @@ static void Fini() {
   delete cvmfs::repository_tag_;
   delete cvmfs::mountpoint_;
   delete cvmfs::voms_authz_;
-  cvmfs::remount_fence_ = NULL;
+  cvmfs::fence_remount_ = NULL;
   cvmfs::signature_manager_ = NULL;
   cvmfs::download_manager_ = NULL;
   cvmfs::external_download_manager_ = NULL;
+  cvmfs::authz_attachment_ = NULL;
+  cvmfs::authz_session_manager_ = NULL;
+  cvmfs::authz_fetcher_ = NULL;
   cvmfs::inode_annotation_ = NULL;
   cvmfs::directory_handles_ = NULL;
   cvmfs::chunk_tables_ = NULL;
@@ -3067,10 +3095,7 @@ static void Fini() {
     sqlite3_temp_directory = NULL;
   }
   sqlite3_shutdown();
-  if (g_sqlite_page_cache) free(g_sqlite_page_cache);
-  if (g_sqlite_scratch) free(g_sqlite_scratch);
-  g_sqlite_page_cache = NULL;
-  g_sqlite_scratch = NULL;
+  SqliteMemoryManager::CleanupInstance();
 
   if (g_monitor_ready) monitor::Fini();
 
@@ -3099,11 +3124,6 @@ static int AltProcessFlavor(int argc, char **argv) {
   if (strcmp(argv[1], "__wpad__") == 0) {
     return download::MainResolveProxyDescription(argc, argv);
   }
-#ifdef VOMS_AUTHZ
-  if (strcmp(argv[1], "__cred_fetcher__") == 0) {
-    return CredentialsFetcher::MainCredentialsFetcher(argc, argv);
-  }
-#endif
   return 1;
 }
 
@@ -3164,7 +3184,7 @@ static bool SaveState(const int fd_progress, loader::StateList *saved_states) {
   SendMsg2Socket(fd_progress, msg_progress);
   ChunkTables *saved_chunk_tables = new ChunkTables(*cvmfs::chunk_tables_);
   loader::SavedState *state_chunk_tables = new loader::SavedState();
-  state_chunk_tables->state_id = loader::kStateOpenFilesV3;
+  state_chunk_tables->state_id = loader::kStateOpenFilesV4;
   state_chunk_tables->state = saved_chunk_tables;
   saved_states->push_back(state_chunk_tables);
 
@@ -3250,7 +3270,7 @@ static bool RestoreState(const int fd_progress,
     }
 
     if (saved_states[i]->state_id == loader::kStateOpenFiles) {
-      SendMsg2Socket(fd_progress, "Migrating chunk tables (v1 to v3)... ");
+      SendMsg2Socket(fd_progress, "Migrating chunk tables (v1 to v4)... ");
       compat::chunk_tables::ChunkTables *saved_chunk_tables =
         (compat::chunk_tables::ChunkTables *)saved_states[i]->state;
       compat::chunk_tables::Migrate(saved_chunk_tables, cvmfs::chunk_tables_);
@@ -3259,7 +3279,7 @@ static bool RestoreState(const int fd_progress,
     }
 
     if (saved_states[i]->state_id == loader::kStateOpenFilesV2) {
-      SendMsg2Socket(fd_progress, "Migrating chunk tables (v2 to v3)... ");
+      SendMsg2Socket(fd_progress, "Migrating chunk tables (v2 to v4)... ");
       compat::chunk_tables_v2::ChunkTables *saved_chunk_tables =
         (compat::chunk_tables_v2::ChunkTables *)saved_states[i]->state;
       compat::chunk_tables_v2::Migrate(saved_chunk_tables,
@@ -3269,6 +3289,16 @@ static bool RestoreState(const int fd_progress,
     }
 
     if (saved_states[i]->state_id == loader::kStateOpenFilesV3) {
+      SendMsg2Socket(fd_progress, "Migrating chunk tables (v3 to v4)... ");
+      compat::chunk_tables_v3::ChunkTables *saved_chunk_tables =
+        (compat::chunk_tables_v3::ChunkTables *)saved_states[i]->state;
+      compat::chunk_tables_v3::Migrate(saved_chunk_tables,
+                                       cvmfs::chunk_tables_);
+      SendMsg2Socket(fd_progress,
+        StringifyInt(cvmfs::chunk_tables_->handle2fd.size()) + " handles\n");
+    }
+
+    if (saved_states[i]->state_id == loader::kStateOpenFilesV4) {
       SendMsg2Socket(fd_progress, "Restoring chunk tables... ");
       delete cvmfs::chunk_tables_;
       ChunkTables *saved_chunk_tables = reinterpret_cast<ChunkTables *>(
@@ -3353,6 +3383,11 @@ static void FreeSavedState(const int fd_progress,
           saved_states[i]->state);
         break;
       case loader::kStateOpenFilesV3:
+        SendMsg2Socket(fd_progress, "Releasing chunk tables (version 3)\n");
+        delete static_cast<compat::chunk_tables_v3::ChunkTables *>(
+          saved_states[i]->state);
+        break;
+      case loader::kStateOpenFilesV4:
         SendMsg2Socket(fd_progress, "Releasing chunk tables\n");
         delete static_cast<ChunkTables *>(saved_states[i]->state);
         break;

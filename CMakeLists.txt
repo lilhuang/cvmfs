@@ -15,11 +15,11 @@ message ("Running CMake version ${CMAKE_VERSION}")
 # The version numbers
 #
 # DON'T DELETE
-## CVMFS_VERSION 2.3.0
+## CVMFS_VERSION 2.3.2
 #---------------------
 set (CernVM-FS_VERSION_MAJOR 2)
 set (CernVM-FS_VERSION_MINOR 3)
-set (CernVM-FS_VERSION_PATCH 0)
+set (CernVM-FS_VERSION_PATCH 2)
 set (CernVM-FS_VERSION_STRING "${CernVM-FS_VERSION_MAJOR}.${CernVM-FS_VERSION_MINOR}.${CernVM-FS_VERSION_PATCH}")
 
 #
@@ -223,15 +223,6 @@ set (LIBGEOIP_BUILTIN_LOCATION    "${EXTERNALS_BUILD_LOCATION}/build_libgeoip")
 set (PYTHON_GEOIP_BUILTIN_LOCATION "${EXTERNALS_BUILD_LOCATION}/build_python-geoip")
 set (TBB_BUILD_LOCATION           "${EXTERNALS_BUILD_LOCATION}/build_tbb")
 
-#
-# Until the bugfix https://sourceware.org/ml/binutils/2015-04/msg00302.html
-# is released in binutils, we disable libcvmfs on AArch64
-#
-if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
-  message("Warning: not building libcvmfs on AArch64")
-  set (BUILD_LIBCVMFS OFF)
-endif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "aarch64")
-
 # create the directory for controlled out of source building of external stuff
 file (MAKE_DIRECTORY ${EXTERNALS_BUILD_LOCATION})
 
@@ -280,7 +271,7 @@ if (BUILD_COVERAGE AND NOT USING_CLANG)
   set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fprofile-arcs -ftest-coverage")
 endif (BUILD_COVERAGE AND NOT USING_CLANG)
 
-set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES})
+set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} cvmfs)
 
 #
 # check existence of include files
@@ -348,64 +339,13 @@ set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${CMAKE_BINARY_DIR})
 # in order to successfully link the targets.
 #
 
-# required libraries for all builds
-if (LIBCURL_BUILTIN)
-  include (${CARES_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-  include (${LIBCURL_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-  set (CURL_LIBRARIES "")
-  set (CARES_LIBRARIES "")
-else (LIBCURL_BUILTIN)
-  find_package (CURL REQUIRED)
-  find_package (CARES REQUIRED)
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${CURL_INCLUDE_DIRS})
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${CARES_INCLUDE_DIRS})
-  if (CURL_INCLUDE_DIRS)
-    find_program(CURL_CONFIG_EXEC NAMES curl-config)
-    if (CURL_CONFIG_EXEC)
-      execute_process(
-       COMMAND ${CURL_CONFIG_EXEC} --features
-       OUTPUT_VARIABLE _libcurl_features
-       ERROR_VARIABLE _libcurl_features_error
-       )
-      if (NOT ${_libcurl_features} MATCHES AsynchDNS)
-       message(FATAL_ERROR "libcurl was not compiled with c-ares")
-      endif (NOT ${_libcurl_features} MATCHES AsynchDNS)
-    else (CURL_CONFIG_EXEC)
-      message(SEND_ERROR "Command \"${CURL_CONFIG_EXEC} --features\" failed with output:\n${_libcurl_features_error}")
-    endif (CURL_CONFIG_EXEC)
-  endif(CURL_INCLUDE_DIRS)
-endif (LIBCURL_BUILTIN)
-
-if (SQLITE3_BUILTIN)
-  include (${SQLITE3_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-  set (SQLITE3_LIBRARY "")
-else (SQLITE3_BUILTIN)
-  find_package (SQLite3 REQUIRED)
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${SQLITE3_INCLUDE_DIR})
-endif (SQLITE3_BUILTIN)
-
-find_package (VOMS)
-if (VOMS_FOUND)
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${VOMS_INCLUDE_DIR})
-  add_definitions(-DVOMS_AUTHZ)
-endif (VOMS_FOUND)
+# Optional libraries
 
 find_package (Valgrind)
 if (VALGRIND_FOUND)
   set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${VALGRIND_INCLUDE_DIR})
   add_definitions(-DHAS_VALGRIND_HEADERS)
 endif (VALGRIND_FOUND)
-
-if (ZLIB_BUILTIN)
-  include (${ZLIB_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-  set (ZLIB_LIBRARIES "")
-else (ZLIB_BUILTIN)
-  find_package (ZLIB REQUIRED)
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${ZLIB_INCLUDE_DIRS})
-endif (ZLIB_BUILTIN)
-
-include (${SHA2_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-include (${SHA3_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
 
 if (NOT MACOSX)
   set (HAVE_LIB_RT TRUE)
@@ -415,8 +355,10 @@ else (NOT MACOSX)
   set (RT_LIBRARY "")
 endif (NOT MACOSX)
 
+# Required libraries depending on build target
+
+# All target require OpenSSL, gtest, vjson
 find_package (OpenSSL REQUIRED)
-find_package (UUID REQUIRED)
 set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${OPENSSL_INCLUDE_DIR})
 
 if (GOOGLETEST_BUILTIN)
@@ -427,7 +369,71 @@ else (GOOGLETEST_BUILTIN)
   set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${GTEST_INCLUDE_DIRS})
 endif (GOOGLETEST_BUILTIN)
 
-if (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_UNITTESTS OR BUILD_PRELOADER)
+include (${VJSON_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${VJSON_BUILTIN_LOCATION}/src)
+
+
+# Most build target require curl/c-ares, sqlite, zlib, sha2/3, uuid, leveldb
+if (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG OR BUILD_PRELOADER)
+  if (LIBCURL_BUILTIN)
+    include (${CARES_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+    include (${LIBCURL_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+    set (CURL_LIBRARIES "")
+    set (CARES_LIBRARIES "")
+  else (LIBCURL_BUILTIN)
+    find_package (CURL REQUIRED)
+    find_package (CARES REQUIRED)
+    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${CURL_INCLUDE_DIRS})
+    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${CARES_INCLUDE_DIRS})
+    if (CURL_INCLUDE_DIRS)
+      find_program(CURL_CONFIG_EXEC NAMES curl-config)
+      if (CURL_CONFIG_EXEC)
+        execute_process(
+         COMMAND ${CURL_CONFIG_EXEC} --features
+         OUTPUT_VARIABLE _libcurl_features
+         ERROR_VARIABLE _libcurl_features_error
+         )
+        if (NOT ${_libcurl_features} MATCHES AsynchDNS)
+         message(FATAL_ERROR "libcurl was not compiled with c-ares")
+        endif (NOT ${_libcurl_features} MATCHES AsynchDNS)
+      else (CURL_CONFIG_EXEC)
+        message(SEND_ERROR "Command \"${CURL_CONFIG_EXEC} --features\" failed with output:\n${_libcurl_features_error}")
+      endif (CURL_CONFIG_EXEC)
+    endif(CURL_INCLUDE_DIRS)
+  endif (LIBCURL_BUILTIN)
+
+  if (SQLITE3_BUILTIN)
+    include (${SQLITE3_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+    set (SQLITE3_LIBRARY "")
+  else (SQLITE3_BUILTIN)
+    find_package (SQLite3 REQUIRED)
+    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${SQLITE3_INCLUDE_DIR})
+  endif (SQLITE3_BUILTIN)
+
+  if (ZLIB_BUILTIN)
+    include (${ZLIB_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+    set (ZLIB_LIBRARIES "")
+  else (ZLIB_BUILTIN)
+    find_package (ZLIB REQUIRED)
+    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${ZLIB_INCLUDE_DIRS})
+  endif (ZLIB_BUILTIN)
+
+  if (LEVELDB_BUILTIN)
+    include (${LEVELDB_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${LEVELDB_BUILTIN_LOCATION}/src)
+  else (LEVELDB_BUILTIN)
+    find_package(leveldb)
+    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${LEVELDB_INCLUDE_DIR})
+  endif (LEVELDB_BUILTIN)
+
+  include (${SHA2_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+  include (${SHA3_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
+
+  find_package (UUID REQUIRED)
+endif (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG OR BUILD_PRELOADER)
+
+# Client/libcvmfs/preloader only: pacparser, sparsehash
+if (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_PRELOADER OR BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG)
   if (PACPARSER_BUILTIN)
     include (${PACPARSER_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
     set (PACPARSER_LIBRARIES "")
@@ -435,10 +441,7 @@ if (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_UNITTESTS OR BUILD_PRELOADER)
     find_package (pacparser REQUIRED)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${PACPARSER_INCLUDE_DIR})
   endif (PACPARSER_BUILTIN)
-endif (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_UNITTESTS OR BUILD_PRELOADER)
 
-# required libraries for client and libcvmfs
-if (BUILD_CVMFS OR BUILD_LIBCVMFS)
   if (SPARSEHASH_BUILTIN)
     include (${SPARSEHASH_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${SPARSEHASH_BUILTIN_LOCATION}/src)
@@ -446,9 +449,9 @@ if (BUILD_CVMFS OR BUILD_LIBCVMFS)
     find_package(Sparsehash)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${SPARSEHASH_INCLUDE_DIR})
   endif (SPARSEHASH_BUILTIN)
-endif (BUILD_CVMFS OR BUILD_LIBCVMFS)
+endif (BUILD_CVMFS OR BUILD_LIBCVMFS OR BUILD_PRELOADER OR BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG)
 
-# required library for fuse client only
+# Fuse client only
 if (BUILD_CVMFS)
   if (MACOSX)
     find_package (OSXFuse REQUIRED)
@@ -458,19 +461,10 @@ if (BUILD_CVMFS)
     find_package (FUSE REQUIRED)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${FUSE_INCLUDE_DIR})
   endif (MACOSX)
-  if (LEVELDB_BUILTIN)
-    include (${LEVELDB_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${LEVELDB_BUILTIN_LOCATION}/src)
-  else (LEVELDB_BUILTIN)
-    find_package(leveldb)
-    set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${LEVELDB_INCLUDE_DIR})
-  endif (LEVELDB_BUILTIN)
 endif (BUILD_CVMFS)
 
-if (BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_UNITTESTS OR BUILD_PRELOADER)
-  include (${VJSON_BUILTIN_LOCATION}/CVMFS-CMakeLists.txt)
-  set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${VJSON_BUILTIN_LOCATION}/src)
-
+# Server/preloader only: tbb
+if (BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_PRELOADER OR BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG)
   if (TBB_PRIVATE_LIB)
     include (${TBB_BUILD_LOCATION}/CVMFS-CMakeLists.txt)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${TBB_BUILD_LOCATION}/include)
@@ -478,8 +472,9 @@ if (BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_UNITTESTS OR BUILD_PRELOADER)
     find_package(TBB REQUIRED)
     set (INCLUDE_DIRECTORIES ${INCLUDE_DIRECTORIES} ${TBB_INCLUDE_DIRS})
   endif (TBB_PRIVATE_LIB)
-endif (BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_UNITTESTS OR BUILD_PRELOADER)
+endif (BUILD_SERVER OR BUILD_SERVER_DEBUG OR BUILD_PRELOADER OR BUILD_UNITTESTS OR BUILD_UNITTESTS_DEBUG)
 
+# Server only: python/geoip, unzip, libcap
 if (BUILD_SERVER OR BUILD_SERVER_DEBUG)
   find_package(PythonLibs REQUIRED)
   find_package(LibCAP REQUIRED)
@@ -497,6 +492,7 @@ if (BUILD_SERVER OR BUILD_SERVER_DEBUG)
     find_python_module (GeoIP REQUIRED)
   endif (GEOIP_BUILTIN)
 endif (BUILD_SERVER OR BUILD_SERVER_DEBUG)
+
 
 include_directories (${INCLUDE_DIRECTORIES})
 

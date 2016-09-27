@@ -18,7 +18,7 @@
 #include "duplex_cares.h"
 #include "gtest/gtest_prod.h"
 #include "prng.h"
-#include "util.h"
+#include "util/single_copy.h"
 
 namespace dns {
 
@@ -70,6 +70,7 @@ std::string ExtractHost(const std::string &url);
 std::string ExtractPort(const std::string &url);
 std::string RewriteUrl(const std::string &url, const std::string &ip);
 std::string StripIp(const std::string &decorated_ip);
+std::string AddDefaultScheme(const std::string &proxy);
 
 
 /**
@@ -299,6 +300,7 @@ class CaresResolver : public Resolver {
  private:
   void WaitOnCares();
   ares_channel *channel_;
+  char *lookup_options_;
   std::vector<std::string> system_resolvers_;
   std::vector<std::string> system_domains_;
 };

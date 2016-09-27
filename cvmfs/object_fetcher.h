@@ -5,6 +5,8 @@
 #ifndef CVMFS_OBJECT_FETCHER_H_
 #define CVMFS_OBJECT_FETCHER_H_
 
+#include <unistd.h>
+
 #include <string>
 
 #include "catalog.h"
@@ -12,7 +14,9 @@
 #include "history_sqlite.h"
 #include "manifest.h"
 #include "manifest_fetch.h"
+#include "reflog.h"
 #include "signature.h"
+#include "util/posix.h"
 
 /**
  * Trait class to define the concrete object types produced by the methods of
@@ -78,10 +82,12 @@ class AbstractObjectFetcher : public ObjectFetcherFailures {
  public:
   typedef typename object_fetcher_traits<DerivedT>::CatalogTN CatalogTN;
   typedef typename object_fetcher_traits<DerivedT>::HistoryTN HistoryTN;
+  typedef typename object_fetcher_traits<DerivedT>::ReflogTN  ReflogTN;
 
   typedef ObjectFetcherFailures::Failures Failures;
 
   static const std::string kManifestFilename;
+  static const std::string kReflogFilename;
 
  public:
   /**
@@ -173,6 +179,35 @@ class AbstractObjectFetcher : public ObjectFetcherFailures {
     return kFailOk;
   }
 
+  Failures FetchReflog(const shash::Any &reflog_hash, ReflogTN **reflog) {
+    assert(!reflog_hash.IsNull());
+    assert(reflog_hash.suffix == shash::kSuffixNone);
+
+    std::string tmp_path;
+    const bool decompress = false;
+    const bool nocache = true;
+    Failures failure = Fetch(kReflogFilename, decompress, nocache, &tmp_path);
+    if (failure != kFailOk) {
+      return failure;
+    }
+
+    // Ensure data integrity
+    shash::Any computed_hash(reflog_hash.algorithm);
+    ReflogTN::HashDatabase(tmp_path, &computed_hash);
+    if (computed_hash != reflog_hash) {
+      unlink(tmp_path.c_str());
+      return kFailBadData;
+    }
+
+    *reflog = ReflogTN::Open(tmp_path);
+    if (NULL == *reflog) {
+      return kFailLocalIO;
+    }
+
+    (*reflog)->TakeDatabaseFileOwnership();
+    return kFailOk;
+  }
+
   Failures FetchManifest(UniquePtr<manifest::Manifest> *manifest) {
     manifest::Manifest *raw_manifest_ptr = NULL;
     Failures failure = FetchManifest(&raw_manifest_ptr);
@@ -203,13 +238,28 @@ class AbstractObjectFetcher : public ObjectFetcherFailures {
     return failure;
   }
 
- public:
+  Failures FetchReflog(const shash::Any &reflog_hash,
+                       UniquePtr<ReflogTN> *reflog)
+  {
+    ReflogTN *raw_reflog_ptr = NULL;
+    Failures failure = FetchReflog(reflog_hash, &raw_reflog_ptr);
+    if (failure == kFailOk) *reflog = raw_reflog_ptr;
+    return failure;
+  }
+
   bool HasHistory() {
     shash::Any history_hash = GetHistoryHash();
     return !history_hash.IsNull();
   }
 
+  const std::string& temporary_directory() const {
+    return temporary_directory_;
+  }
+
  protected:
+  explicit AbstractObjectFetcher(const std::string &temp_dir)
+    : temporary_directory_(temp_dir) {}
+
   /**
    * Internal function used to download objects defined by the given content
    * hash. This needs to be implemented depending on the concrete implementation
@@ -221,6 +271,16 @@ class AbstractObjectFetcher : public ObjectFetcherFailures {
    */
   Failures Fetch(const shash::Any &object_hash, std::string *file_path) {
     return static_cast<DerivedT*>(this)->Fetch(object_hash, file_path);
+  }
+
+  Failures Fetch(const std::string &relative_path,
+                 const bool         decompress,
+                 const bool         nocache,
+                       std::string *file_path) {
+    return static_cast<DerivedT*>(this)->Fetch(relative_path,
+                                               decompress,
+                                               nocache,
+                                               file_path);
   }
 
   /**
@@ -241,11 +301,17 @@ class AbstractObjectFetcher : public ObjectFetcherFailures {
 
     return manifest->history();
   }
+
+ private:
+  const std::string temporary_directory_;
 };
 
 template <class DerivedT>
 const std::string AbstractObjectFetcher<DerivedT>::kManifestFilename =
                                                               ".cvmfspublished";
+template <class DerivedT>
+const std::string AbstractObjectFetcher<DerivedT>::kReflogFilename =
+                                                                 ".cvmfsreflog";
 
 
 /**
@@ -254,16 +320,17 @@ const std::string AbstractObjectFetcher<DerivedT>::kManifestFilename =
  * verification.
  */
 template <class CatalogT = catalog::Catalog,
-          class HistoryT = history::SqliteHistory>
+          class HistoryT = history::SqliteHistory,
+          class ReflogT  = manifest::Reflog>
 class LocalObjectFetcher :
-  public AbstractObjectFetcher<LocalObjectFetcher<CatalogT, HistoryT> >
+  public AbstractObjectFetcher<LocalObjectFetcher<CatalogT, HistoryT, ReflogT> >
 {
  protected:
-  typedef LocalObjectFetcher<CatalogT, HistoryT> ThisTN;
-  typedef AbstractObjectFetcher<ThisTN>          BaseTN;
+  typedef LocalObjectFetcher<CatalogT, HistoryT, ReflogT> ThisTN;
+  typedef AbstractObjectFetcher<ThisTN>                   BaseTN;
 
  public:
-  typedef typename BaseTN::Failures              Failures;
+  typedef typename BaseTN::Failures Failures;
 
  public:
   /**
@@ -274,8 +341,8 @@ class LocalObjectFetcher :
    */
   LocalObjectFetcher(const std::string &base_path,
                      const std::string &temp_dir)
-    : base_path_(base_path)
-    , temporary_directory_(temp_dir) {}
+    : BaseTN(temp_dir)
+    , base_path_(base_path) {}
 
   using BaseTN::FetchManifest;  // un-hiding convenience overload
   Failures FetchManifest(manifest::Manifest** manifest) {
@@ -293,34 +360,50 @@ class LocalObjectFetcher :
     assert(file_path != NULL);
     file_path->clear();
 
+    const std::string relative_path = BuildRelativePath(object_hash);
+    const bool        decompress    = true;
+    const bool        nocache       = false;
+    return Fetch(relative_path, decompress, nocache, file_path);
+  }
+
+
+  Failures Fetch(const std::string &relative_path,
+                 const bool         decompress,
+                 const bool         nocache,
+                       std::string *file_path) {
+    assert(file_path != NULL);
+    file_path->clear();
+
     // check if the requested file object is available locally
-    const std::string source = BuildPath(object_hash);
+    const std::string source = BuildPath(relative_path);
     if (!FileExists(source)) {
-      LogCvmfs(kLogDownload, kLogDebug, "failed to locate object %s",
-               object_hash.ToStringWithSuffix().c_str());
+      LogCvmfs(kLogDownload, kLogDebug, "failed to locate file '%s'",
+               relative_path.c_str());
       return BaseTN::kFailNotFound;
     }
 
-    // create a temporary file to store the decompressed object file
-    const std::string tmp_path = temporary_directory_ + "/" +
-                                 object_hash.ToStringWithSuffix();
+    // create a temporary file to store the (decompressed) object file
+    const std::string tmp_path = BaseTN::temporary_directory() + "/" +
+                                 GetFileName(relative_path);
     FILE *f = CreateTempFile(tmp_path, 0600, "w", file_path);
     if (NULL == f) {
       LogCvmfs(kLogDownload, kLogStderr,
-               "failed to create temp file (errno: %d)", errno);
+               "failed to create temp file '%s' (errno: %d)",
+               tmp_path.c_str(), errno);
       return BaseTN::kFailLocalIO;
     }
 
-    // decompress the requested object file
-    const bool success = zlib::DecompressPath2File(source, f);
+    // decompress or copy the requested object file
+    const bool success = (decompress)
+      ? zlib::DecompressPath2File(source, f)
+      : CopyPath2File(source, f);
     fclose(f);
 
     // check the decompression success and remove the temporary file otherwise
     if (!success) {
-      LogCvmfs(kLogDownload, kLogDebug, "failed to extract object %s from '%s' "
+      LogCvmfs(kLogDownload, kLogDebug, "failed to fetch file from '%s' "
                                         "to '%s' (errno: %d)",
-               object_hash.ToString().c_str(), source.c_str(),
-               file_path->c_str(), errno);
+               source.c_str(), file_path->c_str(), errno);
       unlink(file_path->c_str());
       file_path->clear();
       return BaseTN::kFailDecompression;
@@ -329,25 +412,24 @@ class LocalObjectFetcher :
     return BaseTN::kFailOk;
   }
 
-
  protected:
   std::string BuildPath(const std::string &relative_path) const {
     return base_path_ + "/" + relative_path;
   }
 
-  std::string BuildPath(const shash::Any &hash) const {
-    return BuildPath("data/" + hash.MakePath());
+  std::string BuildRelativePath(const shash::Any &hash) const {
+    return "data/" + hash.MakePath();
   }
 
  private:
   const std::string base_path_;
-  const std::string temporary_directory_;
 };
 
-template <class CatalogT, class HistoryT>
-struct object_fetcher_traits<LocalObjectFetcher<CatalogT, HistoryT> > {
+template <class CatalogT, class HistoryT, class ReflogT>
+struct object_fetcher_traits<LocalObjectFetcher<CatalogT, HistoryT, ReflogT> > {
     typedef CatalogT CatalogTN;
     typedef HistoryT HistoryTN;
+    typedef ReflogT  ReflogTN;
 };
 
 
@@ -357,16 +439,17 @@ struct object_fetcher_traits<LocalObjectFetcher<CatalogT, HistoryT> > {
  * and the downloaded data integrity.
  */
 template <class CatalogT = catalog::Catalog,
-          class HistoryT = history::SqliteHistory>
+          class HistoryT = history::SqliteHistory,
+          class ReflogT  = manifest::Reflog>
 class HttpObjectFetcher :
-  public AbstractObjectFetcher<HttpObjectFetcher<CatalogT, HistoryT> >
+  public AbstractObjectFetcher<HttpObjectFetcher<CatalogT, HistoryT, ReflogT> >
 {
  protected:
-  typedef HttpObjectFetcher<CatalogT, HistoryT>  ThisTN;
-  typedef AbstractObjectFetcher<ThisTN>          BaseTN;
+  typedef HttpObjectFetcher<CatalogT, HistoryT, ReflogT>  ThisTN;
+  typedef AbstractObjectFetcher<ThisTN>                   BaseTN;
 
  public:
-  typedef typename BaseTN::Failures              Failures;
+  typedef typename BaseTN::Failures Failures;
 
  public:
   /**
@@ -385,9 +468,12 @@ class HttpObjectFetcher :
                     const std::string           &repo_url,
                     const std::string           &temp_dir,
                     download::DownloadManager   *download_mgr,
-                    signature::SignatureManager *signature_mgr) :
-    repo_url_(repo_url), repo_name_(repo_name), temporary_directory_(temp_dir),
-    download_manager_(download_mgr), signature_manager_(signature_mgr) {}
+                    signature::SignatureManager *signature_mgr)
+    : BaseTN(temp_dir)
+    , repo_url_(repo_url)
+    , repo_name_(repo_name)
+    , download_manager_(download_mgr)
+    , signature_manager_(signature_mgr) {}
 
  public:
   using BaseTN::FetchManifest;  // un-hiding convenience overload
@@ -439,33 +525,69 @@ class HttpObjectFetcher :
     assert(object_file != NULL);
     assert(!object_hash.IsNull());
 
-    object_file->clear();
+    const bool decompress = true;
+    const bool nocache = false;
+    const std::string url = BuildRelativeUrl(object_hash);
+    return Download(url, decompress, nocache, &object_hash, object_file);
+  }
+
+  Failures Fetch(const std::string &relative_path,
+                 const bool         decompress,
+                 const bool         nocache,
+                       std::string *file_path) {
+    const shash::Any *expected_hash = NULL;
+    return Download(relative_path, decompress, nocache, expected_hash,
+                    file_path);
+  }
+
+ protected:
+  std::string BuildUrl(const std::string &relative_path) const {
+    return repo_url_ + "/" + relative_path;
+  }
+
+  std::string BuildRelativeUrl(const shash::Any &hash) const {
+    return "data/" + hash.MakePath();
+  }
+
+  Failures Download(const std::string &relative_path,
+                    const bool         decompress,
+                    const bool         nocache,
+                    const shash::Any  *expected_hash,
+                          std::string *file_path) {
+    file_path->clear();
 
     // create temporary file to host the fetching result
-    const std::string tmp_path = temporary_directory_ + "/" +
-                                 object_hash.ToStringWithSuffix();
-    FILE *f = CreateTempFile(tmp_path, 0600, "w", object_file);
+    const std::string tmp_path = BaseTN::temporary_directory() + "/" +
+                                 GetFileName(relative_path);
+    FILE *f = CreateTempFile(tmp_path, 0600, "w", file_path);
     if (NULL == f) {
       LogCvmfs(kLogDownload, kLogStderr,
-               "failed to create temp file (errno: %d)", errno);
+               "failed to create temp file '%s' (errno: %d)",
+               tmp_path.c_str(), errno);
       return BaseTN::kFailLocalIO;
     }
 
     // fetch and decompress the requested object
-    const std::string url = BuildUrl(object_hash);
-    download::JobInfo download_catalog(&url, true, false, f, &object_hash);
-    download::Failures retval = download_manager_->Fetch(&download_catalog);
+    const std::string url = BuildUrl(relative_path);
+    const bool probe_hosts = false;
+    download::JobInfo download_job(&url,
+                                        decompress,
+                                        probe_hosts,
+                                        f,
+                                        expected_hash);
+    download_job.force_nocache = nocache;
+    download::Failures retval = download_manager_->Fetch(&download_job);
     const bool success = (retval == download::kFailOk);
     fclose(f);
 
     // check if download worked and remove temporary file if not
     if (!success) {
-      LogCvmfs(kLogDownload, kLogDebug, "failed to download object "
+      LogCvmfs(kLogDownload, kLogDebug, "failed to download file "
                                         "%s to '%s' (%d - %s)",
-               object_hash.ToString().c_str(), object_file->c_str(),
+               relative_path.c_str(), file_path->c_str(),
                retval, Code2Ascii(retval));
-      unlink(object_file->c_str());
-      object_file->clear();
+      unlink(file_path->c_str());
+      file_path->clear();
 
       // hand out the error status
       switch (retval) {
@@ -474,7 +596,7 @@ class HttpObjectFetcher :
 
         case download::kFailProxyHttp:
         case download::kFailHostHttp:
-          return (download_catalog.http_code == 404)
+          return (download_job.http_code == 404)
             ? BaseTN::kFailNotFound
             : BaseTN::kFailNetwork;
 
@@ -491,27 +613,18 @@ class HttpObjectFetcher :
     return BaseTN::kFailOk;
   }
 
- protected:
-  std::string BuildUrl(const std::string &relative_path) const {
-    return repo_url_ + "/" + relative_path;
-  }
-
-  std::string BuildUrl(const shash::Any &hash) const {
-    return BuildUrl("data/" + hash.MakePath());
-  }
-
  private:
   const std::string            repo_url_;
   const std::string            repo_name_;
-  const std::string            temporary_directory_;
   download::DownloadManager   *download_manager_;
   signature::SignatureManager *signature_manager_;
 };
 
-template <class CatalogT, class HistoryT>
-struct object_fetcher_traits<HttpObjectFetcher<CatalogT, HistoryT> > {
+template <class CatalogT, class HistoryT, class ReflogT>
+struct object_fetcher_traits<HttpObjectFetcher<CatalogT, HistoryT, ReflogT> > {
     typedef CatalogT CatalogTN;
     typedef HistoryT HistoryTN;
+    typedef ReflogT  ReflogTN;
 };
 
 #endif  // CVMFS_OBJECT_FETCHER_H_

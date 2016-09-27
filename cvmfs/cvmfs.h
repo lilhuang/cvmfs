@@ -15,10 +15,13 @@
 #include "catalog_mgr.h"
 #include "loader.h"
 #include "lru.h"
-#include "util.h"
 
 namespace cache {
 class CacheManager;
+}
+
+namespace catalog {
+class ClientCatalogManager;
 }
 
 namespace download {
@@ -43,6 +46,7 @@ extern std::string *repository_name_;
 extern download::DownloadManager *download_manager_;
 extern download::DownloadManager *external_download_manager_;
 extern cache::CacheManager *cache_manager_;
+extern catalog::ClientCatalogManager *catalog_manager_;
 extern int max_cache_timeout_;
 extern bool foreground_;
 extern bool nfs_maps_;
@@ -58,6 +62,7 @@ std::string GetOpenCatalogs();
 unsigned GetMaxTTL();  // in minutes
 void SetMaxTTL(const unsigned value);  // in minutes
 void ResetErrorCounters();
+std::string PrintInodeGeneration();
 void UnregisterQuotaListener();
 
 }  // namespace cvmfs

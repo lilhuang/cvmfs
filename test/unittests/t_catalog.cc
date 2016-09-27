@@ -7,11 +7,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "../../cvmfs/catalog.h"
-#include "../../cvmfs/catalog_rw.h"
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/shortstring.h"
-#include "../../cvmfs/util.h"
+#include "catalog.h"
+#include "catalog_rw.h"
+#include "hash.h"
+#include "shortstring.h"
 #include "testutil.h"
 
 using namespace std;  // NOLINT
@@ -300,6 +299,15 @@ TEST_F(T_Catalog, Chunks) {
   }
   EXPECT_TRUE(catalog->AllChunksEnd());
   EXPECT_EQ(4u, counter);  // number of files with content + empty hash
+}
+
+TEST_F(T_Catalog, Statistics) {
+  catalog = catalog::Catalog::AttachFreely("",
+                                           catalog_db_root,
+                                           shash::Any(),
+                                           NULL,
+                                           false);
+  EXPECT_NE("", catalog->PrintMemStatistics());
 }
 
 }  // namespace catalog

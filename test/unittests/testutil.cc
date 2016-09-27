@@ -14,11 +14,12 @@
 #include <map>
 #include <sstream>  // TODO(jblomer): remove me
 
-#include "../../cvmfs/hash.h"
-#include "../../cvmfs/manifest.h"
+#include "hash.h"
+#include "manifest.h"
 #include "testutil.h"
 
 
+#ifndef __APPLE__
 static void SkipWhitespace(std::istringstream *iss) {
   while (iss->good()) {
     const char next = iss->peek();
@@ -28,6 +29,7 @@ static void SkipWhitespace(std::istringstream *iss) {
     iss->get();
   }
 }
+#endif
 
 
 pid_t GetParentPid(const pid_t pid) {
@@ -448,9 +450,25 @@ MockObjectFetcher::Fetch(const shash::Any   &object_hash,
   return MockObjectFetcher::kFailOk;
 }
 
+MockObjectFetcher::Failures
+MockObjectFetcher::Fetch(const std::string &relative_path,
+                         const bool         decompress,
+                         const bool         nocache,
+                         std::string *file_path) {
+  *file_path = relative_path;
+  if (!PathExists(relative_path)) {
+    return MockObjectFetcher::kFailNotFound;
+  }
+  return MockObjectFetcher::kFailOk;
+}
+
 bool MockObjectFetcher::ObjectExists(const shash::Any &object_hash) const {
   return MockCatalog::Exists(object_hash) ||
          MockHistory::Exists(object_hash);
+}
+
+bool MockObjectFetcher::PathExists(const std::string &path) const {
+  return MockReflog::Exists(path);
 }
 
 
@@ -648,4 +666,122 @@ bool MockHistory::GetHashes(std::vector<shash::Any> *hashes) const {
   std::transform(tags.rbegin(), tags.rend(),
                  hashes->begin(), MockHistory::get_hash);
   return true;
+}
+
+
+//------------------------------------------------------------------------------
+
+
+MockReflog* MockReflog::Open(const std::string &path) {
+  MockReflog* reflog = MockReflog::Get(path);
+  if (NULL == reflog) {
+    return NULL;
+  }
+  return reflog->Clone();
+}
+
+MockReflog* MockReflog::Create(const std::string &path,
+                               const std::string &repo_name) {
+  MockReflog *reflog = new MockReflog(repo_name);
+  MockReflog::RegisterPath(path, reflog);
+  return reflog;
+}
+
+
+void MockReflog::HashDatabase(
+  const std::string &database_path,
+  shash::Any *hash_reflog)
+{
+  HashString("", hash_reflog);
+}
+
+
+MockReflog* MockReflog::Clone() const {
+  MockReflog *new_reflog = new MockReflog(*this);
+  return new_reflog;
+}
+
+MockReflog::MockReflog(const std::string fqrn)
+  : owns_database_file_(false)
+  , fqrn_(fqrn) {}
+
+bool MockReflog::AddCertificate(const shash::Any &certificate) {
+  references_[certificate] = time(NULL);
+  return true;
+}
+
+bool MockReflog::AddCatalog(const shash::Any &catalog) {
+  references_[catalog] = time(NULL);
+  return true;
+}
+
+bool MockReflog::AddHistory(const shash::Any &history) {
+  references_[history] = time(NULL);
+  return true;
+}
+
+bool MockReflog::AddMetainfo(const shash::Any &metainfo) {
+  references_[metainfo] = time(NULL);
+  return true;
+}
+
+bool MockReflog::List(
+  SqlReflog::ReferenceType type,
+  std::vector<shash::Any> *hashes) const
+{
+  return ListOlderThan(type, static_cast<uint64_t>(-1), hashes);
+}
+
+bool MockReflog::ListOlderThan(
+  SqlReflog::ReferenceType type,
+  uint64_t timestamp,
+  std::vector<shash::Any> *hashes) const
+{
+  hashes->clear();
+  for (map<shash::Any, uint64_t>::const_iterator i = references_.begin(),
+       i_end = references_.end(); i != i_end; ++i)
+  {
+    if ((i->first.suffix == SqlReflog::ToSuffix(type)) &&
+        (i->second < timestamp))
+    {
+      hashes->push_back(i->first);
+    }
+  }
+  std::sort(hashes->begin(), hashes->end());
+
+  return true;
+}
+
+bool MockReflog::GetCatalogTimestamp(
+  const shash::Any &catalog,
+  uint64_t *timestamp)
+{
+  std::map<shash::Any, uint64_t>::const_iterator iter =
+    references_.find(catalog);
+  if (iter == references_.end())
+    return false;
+  *timestamp = iter->second;
+  return true;
+}
+
+
+bool MockReflog::Remove(const shash::Any &hash) {
+  references_.erase(hash);
+  return true;
+}
+
+bool MockReflog::ContainsCertificate(const shash::Any &certificate) const {
+  return references_.count(certificate) == 1;
+}
+
+bool MockReflog::ContainsCatalog(const shash::Any &catalog) const {
+  return references_.count(catalog) == 1;
+}
+
+bool MockReflog::ContainsHistory(const shash::Any &history) const {
+  return references_.count(history) == 1;
+}
+
+bool MockReflog::ContainsMetainfo(const shash::Any &metainfo) const {
+  return references_.count(metainfo) == 1;
 }

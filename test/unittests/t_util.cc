@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <alloca.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -12,14 +13,19 @@
 #include <tbb/tbb_thread.h>
 #include <unistd.h>
 
+#include <cstring>
 #include <ctime>
 #include <limits>
 #include <vector>
 
-#include "../../cvmfs/shortstring.h"
-#include "../../cvmfs/smalloc.h"
-#include "../../cvmfs/util.h"
+#include "shortstring.h"
+#include "smalloc.h"
 #include "testutil.h"
+#include "util/algorithm.h"
+#include "util/file_guard.h"
+#include "util/mmap_file.h"
+#include "util/posix.h"
+#include "util/string.h"
 
 using namespace std;  // NOLINT
 
@@ -401,7 +407,7 @@ TEST_F(T_Util, MakeSocket) {
 
   ASSERT_DEATH(MakeSocket(long_path, 0600), ".*");
   EXPECT_NE(-1, socket_fd1 = MakeSocket(socket_address, 0777));
-  // the second time it should work as well (non socket-alrady-in-use error)
+  // the second time it should work as well (no socket-already-in-use error)
   EXPECT_NE(-1, socket_fd2 = MakeSocket(socket_address, 0777));
   close(socket_fd1);
   close(socket_fd2);
@@ -409,12 +415,13 @@ TEST_F(T_Util, MakeSocket) {
 
 TEST_F(T_Util, ConnectSocket) {
   int server_fd = MakeSocket(socket_address, 0777);
+  ASSERT_LT(0, server_fd);
   listen(server_fd, 1);
   int client_fd = ConnectSocket(socket_address);
+  ASSERT_NE(-1, client_fd);
 
   ASSERT_DEATH(ConnectSocket(long_path), ".*");
   ASSERT_EQ(-1, ConnectSocket(sandbox + "/fake_socket"));
-  ASSERT_NE(-1, client_fd);
   close(client_fd);
   close(server_fd);
 }
@@ -424,7 +431,8 @@ TEST_F(T_Util, MakePipe) {
   void *buffer_output = scalloc(100, sizeof(char));
   MakePipe(fd);
   write(fd[1], to_write.c_str(), to_write.length());
-  read(fd[0], buffer_output, to_write.length());
+  ssize_t bytes_read = read(fd[0], buffer_output, to_write.length());
+  EXPECT_EQ(static_cast<size_t>(bytes_read), to_write.length());
 
   EXPECT_STREQ(to_write.c_str(), static_cast<const char*>(buffer_output));
   ASSERT_DEATH(MakePipe(static_cast<int*>(NULL)), ".*");
@@ -437,7 +445,8 @@ TEST_F(T_Util, WritePipe) {
   void *buffer_output = scalloc(20, sizeof(char));
   MakePipe(fd);
   WritePipe(fd[1], to_write.c_str(), to_write.length());
-  read(fd[0], buffer_output, to_write.length());
+  ssize_t bytes_read = read(fd[0], buffer_output, to_write.length());
+  EXPECT_EQ(static_cast<size_t>(bytes_read), to_write.length());
 
   EXPECT_STREQ(to_write.c_str(), static_cast<const char*>(buffer_output));
   ASSERT_DEATH(WritePipe(-1, to_write.c_str(), to_write.length()),
@@ -476,12 +485,11 @@ TEST_F(T_Util, ReadHalfPipe) {
 
 TEST_F(T_Util, ClosePipe) {
   int fd[2];
-  void *buffer_output = scalloc(20, sizeof(char));
+  UniquePtr<void> buffer_output(scalloc(20, sizeof(char)));
   MakePipe(fd);
   ClosePipe(fd);
   ASSERT_DEATH(WritePipe(fd[1], to_write.c_str(), to_write.length()), ".*");
   ASSERT_DEATH(ReadPipe(fd[0], buffer_output, to_write.length()), ".*");
-  free(buffer_output);
 }
 
 
@@ -499,7 +507,8 @@ TEST_F(T_Util, SafeWrite) {
   void *buffer_output = scalloc(20, sizeof(char));
   MakePipe(fd);
   SafeWrite(fd[1], to_write.c_str(), to_write.length());
-  read(fd[0], buffer_output, to_write.length());
+  ssize_t bytes_read = read(fd[0], buffer_output, to_write.length());
+  EXPECT_EQ(static_cast<size_t>(bytes_read), to_write.length());
   EXPECT_STREQ(to_write.c_str(), static_cast<const char*>(buffer_output));
   free(buffer_output);
 
@@ -578,7 +587,7 @@ TEST_F(T_Util, SafeRead) {
   close(fd[0]);
 
   char fail;
-  EXPECT_EQ(SafeRead(-1, &fail, 1), -1);
+  EXPECT_EQ(-1, SafeRead(-1, &fail, 1));
   std::string fail_str;
   EXPECT_FALSE(SafeReadToString(-1, &fail_str));
 }
@@ -607,22 +616,28 @@ TEST_F(T_Util, Block2Nonblock) {
 }
 
 TEST_F(T_Util, SendMes2Socket) {
-  void *buffer = scalloc(20, sizeof(char));
+  void *buffer = alloca(20);
+  memset(buffer, 0, 20);
   struct sockaddr_in client_addr;
   unsigned int client_length = sizeof(client_addr);
+
   int server_fd = MakeSocket(socket_address, 0777);
+  ASSERT_LT(0, server_fd);
+  FdGuard fd_guard_server(server_fd);
   listen(server_fd, 1);
+
   int client_fd = ConnectSocket(socket_address);
+  ASSERT_LE(0, client_fd);
+  FdGuard fd_guard_client(client_fd);
   SendMsg2Socket(client_fd, to_write);
   int new_connection = accept(server_fd, (struct sockaddr *) &client_addr,
-      &client_length);
-  read(new_connection, buffer, to_write.length());
+                              &client_length);
+  ASSERT_LE(0, new_connection);
+  FdGuard fd_guard_connection(new_connection);
+  ssize_t bytes_read = read(new_connection, buffer, to_write.length());
+  EXPECT_EQ(static_cast<size_t>(bytes_read), to_write.length());
 
   EXPECT_STREQ(to_write.c_str(), static_cast<const char*>(buffer));
-  close(new_connection);
-  close(client_fd);
-  close(server_fd);
-  free(buffer);
 }
 
 TEST_F(T_Util, Mutex) {
@@ -750,8 +765,11 @@ TEST_F(T_Util, UnlockFile) {
   EXPECT_EQ(-2, TryLockFile(filename));
   UnlockFile(fd1);
   EXPECT_LE(0, fd2 = TryLockFile(filename));  // can be locked again
-  close(fd1);
-  close(fd2);
+
+  // no need to close fd1
+  if (fd2 >= 0) {
+    close(fd2);
+  }
 }
 
 TEST_F(T_Util, CreateTempFile) {
@@ -1033,8 +1051,8 @@ TEST_F(T_Util, ParseKeyvalMem) {
 
 TEST_F(T_Util, ParseKeyvalPath) {
   map<char, string> map;
-  const char *big_buffer = static_cast<const char *>(scalloc(8000,
-      sizeof(char)));
+  UniquePtr<const char> big_buffer(static_cast<const char *>(scalloc(8000,
+      sizeof(char))));
   string big_file = "bigfile.txt";
   string content_file = "contentfile.txt";
   string cvmfs_published =
@@ -1116,10 +1134,20 @@ TEST_F(T_Util, GetLineFd) {
   string file2 = CreateFileWithContent("file2.txt", "\ncontent\ncontent2\n");
   string file3 = CreateFileWithContent("file3.txt", "mycompletestring");
   string file4 = CreateFileWithContent("file4.txt", "");
+
   int fd1 = open(file1.c_str(), O_RDONLY);
   int fd2 = open(file2.c_str(), O_RDONLY);
   int fd3 = open(file3.c_str(), O_RDONLY);
   int fd4 = open(file4.c_str(), O_RDONLY);
+  FdGuard fd_guard_1(fd1);
+  FdGuard fd_guard_2(fd2);
+  FdGuard fd_guard_3(fd3);
+  FdGuard fd_guard_4(fd4);
+
+  ASSERT_LE(0, fd1);
+  ASSERT_LE(0, fd2);
+  ASSERT_LE(0, fd3);
+  ASSERT_LE(0, fd4);
 
   EXPECT_TRUE(GetLineFd(fd1, &result));
   EXPECT_EQ("first", result);
@@ -1129,10 +1157,6 @@ TEST_F(T_Util, GetLineFd) {
   EXPECT_EQ("mycompletestring", result);
   EXPECT_FALSE(GetLineFd(fd4, &result));  // no content
   EXPECT_EQ("", result);
-  close(fd1);
-  close(fd2);
-  close(fd3);
-  close(fd4);
 }
 
 TEST_F(T_Util, Trim) {
@@ -1218,7 +1242,8 @@ TEST_F(T_Util, ExecuteBinary) {
       false,
       &gdb_pid);
   EXPECT_TRUE(result);
-  read(fd_stdout, buffer, message.length());
+  ssize_t bytes_read = read(fd_stdout, buffer, message.length());
+  EXPECT_EQ(static_cast<size_t>(bytes_read), message.length());
   string response(buffer, message.length());
   EXPECT_EQ(message, response);
 }
@@ -1249,7 +1274,7 @@ TEST_F(T_Util, ManagedExecCommandLine) {
   pid_t pid;
   int fd_stdout[2];
   int fd_stdin[2];
-  char *buffer = static_cast<char*>(scalloc(100, sizeof(char)));
+  UniquePtr<char> buffer(static_cast<char*>(scalloc(100, sizeof(char))));
   MakePipe(fd_stdout);
   MakePipe(fd_stdin);
   string message = "CVMFS";
@@ -1267,11 +1292,11 @@ TEST_F(T_Util, ManagedExecCommandLine) {
       &pid);
   ASSERT_TRUE(success);
   close(fd_stdout[1]);
-  read(fd_stdout[0], buffer, message.length());
+  ssize_t bytes_read = read(fd_stdout[0], buffer, message.length());
+  EXPECT_EQ(static_cast<size_t>(bytes_read), message.length());
   string result(buffer);
   ASSERT_EQ(message, result);
   close(fd_stdout[0]);
-  free(buffer);
 }
 
 TEST_F(T_Util, ManagedExecRunShell) {

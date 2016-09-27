@@ -9,7 +9,7 @@ ZLIB_VERSION=1.2.8
 SPARSEHASH_VERSION=1.12
 LEVELDB_VERSION=1.18
 GOOGLETEST_VERSION=1.7.0
-TBB_VERSION=4.3-1
+TBB_VERSION=4.4-5
 LIBGEOIP_VERSION=1.6.0
 PYTHON_GEOIP_VERSION=1.3.1
 
@@ -125,6 +125,7 @@ patch_external "tbb"         "custom_library_suffix.patch"        \
                              "32bit_mock.patch"
 patch_external "vjson"       "missing_include.patch"
 patch_external "sparsehash"  "fix_sl4_compilation.patch"
+patch_external "libcurl"     "disable_sslv3.patch"
 
 replace_in_external "c-ares"      "config.guess.latest" "config.guess"
 replace_in_external "c-ares"      "config.sub.latest" "config.sub"

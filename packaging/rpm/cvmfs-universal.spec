@@ -1,5 +1,8 @@
 
 %{?suse_version:%define dist .suse%suse_version}
+%if 0%{?suse_version} == 1315
+%define dist .sle12
+%endif
 %if 0%{?el6} || 0%{?el7} || 0%{?fedora}
 %define selinux_cvmfs 1
 %define selinux_variants mls strict targeted
@@ -21,7 +24,7 @@
 
 Summary: CernVM File System
 Name: cvmfs
-Version: 2.3.0
+Version: 2.3.2
 Release: 1%{?dist}
 Source0: https://ecsft.cern.ch/dist/cvmfs/%{name}-%{version}.tar.gz
 %if 0%{?selinux_cvmfs}
@@ -31,15 +34,6 @@ Source2: cvmfs.fc
 Group: Applications/System
 License: BSD
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root-%(%{__id_u} -n)
-
-# Build with voms-devel on Fedora / RHEL derivatives.
-# Note that we *load* VOMS at runtime, not link against it; this means that
-# the produced RPM will not depend on VOMS.
-%if 0%{?suse_version}
-# TODO(bbockelm): figure out solution for VOMS on SUSE.
-%else
-BuildRequires: voms-devel
-%endif
 
 %if 0%{?el5}
 BuildRequires: buildsys-macros
@@ -194,6 +188,10 @@ cp %{SOURCE1} %{SOURCE2} SELinux
 %ifarch i386 i686
 export CXXFLAGS="`echo %{optflags}|sed 's/march=i386/march=i686/'`"
 export CFLAGS="`echo %{optflags}|sed 's/march=i386/march=i686/'`"
+%if 0%{?el5}
+export CFLAGS="$CFLAGS -O0"
+export CXXFLAGS="$CXXFLAGS -O0"
+%endif
 %endif
 
 %if 0%{?el4}
@@ -220,6 +218,27 @@ do
     make NAME=${variant} -f %{_datadir}/selinux/devel/Makefile clean
 done
 popd
+%endif
+
+%if 0%{?el4}
+%else
+%pretrans server
+[ -d "/var/spool/cvmfs"  ]          || exit 0
+[ -d "/etc/cvmfs/repositories.d/" ] || exit 0
+
+for repo in /var/spool/cvmfs/*; do
+  [ -d $repo ] && [ ! -f /etc/cvmfs/repositories.d/$(basename $repo)/replica.conf ] || continue
+
+  if [ -f ${repo}/in_transaction.lock ] || \
+     [ -d ${repo}/in_transaction      ] || \
+     [ -f ${repo}/in_transaction      ]; then
+    echo "     Found open CernVM-FS repository transactions."           >&2
+    echo "     Please abort or publish them before updating CernVM-FS." >&2
+    exit 1
+  fi
+done
+
+exit 0
 %endif
 
 %pre
@@ -312,6 +331,9 @@ if [ -d /var/run/cvmfs ]; then
 fi
 :
 
+%post server
+/usr/bin/cvmfs_server fix-permissions || :
+
 %preun
 if [ $1 = 0 ] ; then
 %if 0%{?selinux_cvmfs}
@@ -351,6 +373,8 @@ fi
 %{_bindir}/cvmfs_fsck
 %{_bindir}/cvmfs_config
 /usr/libexec/cvmfs/auto.cvmfs
+/usr/libexec/cvmfs/authz/cvmfs_allow_helper
+/usr/libexec/cvmfs/authz/cvmfs_deny_helper
 %{_sysconfdir}/auto.cvmfs
 %{_sysconfdir}/cvmfs/config.sh
 %if 0%{?selinux_cvmfs}
@@ -404,6 +428,22 @@ fi
 %doc COPYING AUTHORS README ChangeLog
 
 %changelog
+* Mon Aug 22 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
+- Reset cvmfs_swissknife capability if overlayfs is used
+* Wed Aug 10 2016 Dave Dykstra <dwd@fnal.gov> - 2.3.1
+- Update version number to 2.3.1
+* Thu Jul 28 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
+- Update upstream package
+* Thu Jun 30 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
+- Fix SLES12 dist tag
+* Tue May 03 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.0
+- No optimiziation on EL5/i686 to prevent faulty atomics
+* Fri Apr 29 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.0
+- voms-devel not necessary anymore
+* Mon Apr 11 2016 Rene Meusel <rene.meusel@cern.ch> - 2.3.0
+- Disable open repo transaction check in EL4
+* Thu Apr 07 2016 Rene Meusel <rene.meusel@cern.ch> - 2.3.0
+- Check for open repo transactions before updating server package
 * Sat Jan 23 2016 Brian Bockelman <bbockelm@cse.unl.edu> - 2.2.0
 - Build with VOMS support
 * Thu Jan 21 2016 Jakob Blomer <jblomer@cern.ch> - 2.2.0

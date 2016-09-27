@@ -6,8 +6,11 @@
 
 #include <unistd.h>
 
-#include "../../cvmfs/util.h"
-#include "../../cvmfs/uuid.h"
+#include "util/file_guard.h"
+#include "util/pointer.h"
+#include "util/posix.h"
+#include "util/string.h"
+#include "uuid.h"
 
 using namespace std;  // NOLINT
 

@@ -21,7 +21,6 @@
 #include "shortstring.h"
 #include "sql.h"
 #include "uid_map.h"
-#include "util.h"
 #include "xattr.h"
 
 namespace swissknife {
@@ -176,6 +175,7 @@ class Catalog : public SingleCopy {
   uint64_t GetNumChunks() const;
   shash::Any GetPreviousRevision() const;
   const Counters& GetCounters() const { return counters_; }
+  std::string PrintMemStatistics() const;
 
   inline float schema() const { return database().schema_version(); }
   inline PathString path() const { return path_; }
@@ -219,6 +219,8 @@ class Catalog : public SingleCopy {
   typedef std::map<uint64_t, inode_t> HardlinkGroupMap;
   mutable HardlinkGroupMap hardlink_groups_;
 
+  pthread_mutex_t *lock_;
+
   bool InitStandalone(const std::string &database_file);
   bool ReadCatalogCounters();
 
@@ -244,7 +246,7 @@ class Catalog : public SingleCopy {
   inline       CatalogDatabase &database()       { return *database_; }
   inline void set_parent(Catalog *catalog) { parent_ = catalog; }
 
-  void ResetNestedCatalogCache();
+  void ResetNestedCatalogCacheUnprotected();
 
  private:
   typedef std::map<PathString, Catalog*> NestedCatalogMap;
@@ -266,7 +268,6 @@ class Catalog : public SingleCopy {
   bool LookupEntry(const shash::Md5 &md5path, const bool expand_symlink,
                    DirectoryEntry *dirent) const;
   CatalogDatabase *database_;
-  pthread_mutex_t *lock_;
 
   const shash::Any catalog_hash_;
   PathString root_prefix_;
@@ -294,7 +295,6 @@ class Catalog : public SingleCopy {
 
   SqlListing               *sql_listing_;
   SqlLookupPathHash        *sql_lookup_md5path_;
-  SqlLookupInode           *sql_lookup_inode_;
   SqlNestedCatalogLookup   *sql_lookup_nested_;
   SqlNestedCatalogListing  *sql_list_nested_;
   SqlAllChunks             *sql_all_chunks_;

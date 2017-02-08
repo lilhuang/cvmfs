@@ -24,7 +24,7 @@
 
 Summary: CernVM File System
 Name: cvmfs
-Version: 2.3.2
+Version: 2.3.3
 Release: 1%{?dist}
 Source0: https://ecsft.cern.ch/dist/cvmfs/%{name}-%{version}.tar.gz
 %if 0%{?selinux_cvmfs}
@@ -158,8 +158,6 @@ Requires: libcap
 Requires: lsof
 Requires: rsync
 %if 0%{?el6} || 0%{?el7} || 0%{?fedora} || 0%{?suse_version} >= 1300
-# this is 'nice-to-have' at the moment
-# TODO(rmeusel): consider using 'Recommends:' in the far future
 Requires: jq
 %endif
 

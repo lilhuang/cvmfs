@@ -208,7 +208,7 @@ static void *MainTalk(void *data __attribute__((unused))) {
         if (!quota_mgr->IsEnforcing()) {
           Answer(con_fd, "Cache is unmanaged\n");
         } else {
-          if (line.length() < 9) {
+          if (line.length() < 14) {
             Answer(con_fd, "Usage: cleanup rate <period in mn>\n");
           } else {
             const uint64_t period_s = String2Uint64(line.substr(13)) * 60;
@@ -317,6 +317,9 @@ static void *MainTalk(void *data __attribute__((unused))) {
           Answer(con_fd, "OK\n");
         else
           Answer(con_fd, "Failed\n");
+      } else if (line == "external host switch") {
+        cvmfs::external_download_manager_->SwitchHost();
+        Answer(con_fd, "OK\n");
       } else if (line == "host switch") {
         cvmfs::download_manager_->SwitchHost();
         Answer(con_fd, "OK\n");

@@ -89,7 +89,6 @@ CVMFS_TEST_SERVER_CACHE='/srv/cache/server'                                   \
 CVMFS_TEST_CLASS_NAME=ServerIntegrationTests                                  \
 ./run.sh $SERVER_TEST_LOGFILE -o ${SERVER_TEST_LOGFILE}${XUNIT_OUTPUT_SUFFIX} \
                               -x src/518-hardlinkstresstest                   \
-                                 src/523-corruptchunkfailover                 \
                                  src/524-corruptmanifestfailover              \
                                  src/551-openfds                              \
                                  src/585-xattrs                               \
@@ -97,9 +96,11 @@ CVMFS_TEST_CLASS_NAME=ServerIntegrationTests                                  \
                                  src/608-infofile                             \
                                  src/609-metainfofile                         \
                                  src/628-pythonwrappedcvmfsserver             \
+				 src/700-overlayfs_validation                 \
                                  --                                           \
                                  src/5*                                       \
                                  src/6*                                       \
+                                 src/7*                                       \
                               || retval=1
 
 

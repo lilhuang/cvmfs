@@ -329,7 +329,7 @@ Supported Commands:
                   <fully qualified name>
                   Make a new repository snapshot
   gc              [-r number of revisions to preserve]
-                  [-t time stamp after which revisions are reseved]
+                  [-t time stamp after which revisions are preserved]
                   [-l (print deleted objects)] [-L log of deleted objects]
                   [-f (force)] [-d (dry run)]
                   <fully qualified repository name>
@@ -513,6 +513,10 @@ least CernVM-FS $creator to manipulate this repository."
   #   2.2.0-1+ -> 2.3.0-1
   #     -> new scratch directory layout (which also effects /etc/fstab)
   #
+  #   2.3.0-1+ --> 2.3.3-1
+  #     -> update global JSON info if repo was migrated from 2.1.20 or before
+  #        (CVM-1159)
+  #
   # Note: I tried to make this code as verbose as possible
   #
   if [ "$creator" = "2.1.6" ] && version_greater_or_equal "2.1.7"; then
@@ -558,6 +562,16 @@ least CernVM-FS $creator to manipulate this repository."
      [ "$creator" = "2.2.2-1" ] || [ "$creator" = "2.2.3-1" ] && \
      is_stratum0 $name; then
     if version_greater_or_equal "2.3.0"; then
+      _repo_is_incompatible "$creator" $nokill
+      return $?
+    fi
+  fi
+
+  if [ "$creator" = "2.2.0-1" ] || [ "$creator" = "2.2.1-1" ] || \
+     [ "$creator" = "2.2.2-1" ] || [ "$creator" = "2.2.3-1" ] || \
+     [ "$creator" = "2.3.0-1" ] || [ "$creator" = "2.3.1-1" ] || \
+     [ "$creator" = "2.3.2-1" ]; then
+    if version_greater_or_equal "2.3.3"; then
       _repo_is_incompatible "$creator" $nokill
       return $?
     fi
@@ -632,8 +646,15 @@ check_overlayfs() {
 # @return  0 if overlayfs is installed and viable
 check_overlayfs_version() {
   [ -z "$CVMFS_DONT_CHECK_OVERLAYFS_VERSION" ] || return 0
-  local krnl_version=$(uname -r | grep -oe '^[0-9]\+\.[0-9]\+.[0-9]\+')
-  compare_versions "$krnl_version" -ge "4.2.0"
+  local scratch_fstype=$(df -T /var/spool/cvmfs | tail -1 | awk {'print $2'})
+  local krnl_version=$(uname -r | grep -oe '^[0-9]\+\.[0-9]\+.[0-9]\+-*[0-9]*')
+  if compare_versions "$krnl_version" -ge "4.2.0" ; then
+      return 0
+  elif is_redhat && $(compare_versions "$krnl_version" -ge "3.10.0-493") && [ "x$scratch_fstype" = "xext4" ] ; then
+      return 0
+  else
+      return 1
+  fi
 }
 
 
@@ -1147,7 +1168,7 @@ __is_valid_lock() {
   [ -z "$ignore_stale" ] || return 0 # lock is there (skip the stale test)
 
   local stale_pid=$(cat $lock_file 2>/dev/null)
-  [ $stale_pid -gt 0 ]     && \
+  [ -n "$stale_pid" ] && [ $stale_pid -gt 0 ]     && \
   kill -0 $stale_pid 2>/dev/null
 }
 
@@ -1211,6 +1232,8 @@ run_suid_helper() {
 is_in_transaction() {
   local name=$1
   load_repo_config $name
+  # ignore if the lock is "stale" because the process starting
+  #  transactions goes away
   check_lock ${CVMFS_SPOOL_DIR}/in_transaction ignore_stale
 }
 
@@ -1220,6 +1243,8 @@ open_transaction() {
   local tx_lock="${CVMFS_SPOOL_DIR}/in_transaction"
 
   is_stratum0 $name                    || die "Cannot open transaction on Stratum1"
+  # ignore if lock is "stale" because the process that created it
+  #  goes away
   acquire_lock "$tx_lock" ignore_stale || die "Failed to create transaction lock"
   run_suid_helper open $name           || die "Failed to make /cvmfs/$name writable"
 
@@ -1274,10 +1299,17 @@ close_transaction() {
   local async_msg=""
   if [ x"$CVMFS_ASYNC_SCRATCH_CLEANUP" != x"false" ]; then
     tmpdir=$(mktemp -d "${wastebin_scratch_dir}/waste.XXXXXX")
-    mv $current_scratch_dir $tmpdir
-    mkdir -p $current_scratch_dir && chown $CVMFS_USER $current_scratch_dir
-    async_msg="(asynchronous scratch cleanup)"
-    run_suid_helper clear_scratch_async $name
+    # Some AUFS versions return "Device or resource busy" when there are still
+    # open file descriptors on the r/w branch (union mount point)
+    if mv $current_scratch_dir $tmpdir; then
+      mkdir -p $current_scratch_dir && chown $CVMFS_USER $current_scratch_dir
+      async_msg="(asynchronous scratch cleanup)"
+      run_suid_helper clear_scratch_async $name
+    else
+      to_syslog_for_repo $name \
+        "asynchronous cleanup failed, doing synchronous cleanup"
+      run_suid_helper clear_scratch $name
+    fi
   else
     run_suid_helper clear_scratch $name
   fi
@@ -1291,21 +1323,21 @@ close_transaction() {
   to_syslog_for_repo $name "closed transaction $fallback_msg $async_msg"
 }
 
-# checks if a repository is currently runing a publish procedure
+# checks if a repository is currently running a publish procedure
 #
 # @param name  the repository name to be checked
 # @return      0 if a publishing procedure is running
 is_publishing() {
   local name=$1
   load_repo_config $name
-  check_lock ${CVMFS_SPOOL_DIR}/is_publishing ignore_stale
+  check_lock ${CVMFS_SPOOL_DIR}/is_publishing
 }
 
 publish_starting() {
   local name=$1
   load_repo_config $name
   local pub_lock="${CVMFS_SPOOL_DIR}/is_publishing"
-  acquire_lock "$pub_lock" ignore_stale || die "Failed to acquire publishing lock"
+  acquire_lock "$pub_lock" || die "Failed to acquire publishing lock"
   trap "publish_failed $name" EXIT HUP INT TERM
   run_suid_helper lock $name
   to_syslog_for_repo $name "started publishing"
@@ -1328,6 +1360,68 @@ publish_succeeded() {
   trap - EXIT HUP INT TERM
   release_lock $pub_lock
   to_syslog_for_repo $name "successfully published revision $(get_repo_info -v)"
+}
+
+
+# Release an update lock
+#
+# @param name             the repository to release
+
+release_update_lock() {
+  local name=$1
+
+  load_repo_config $name
+  release_lock ${CVMFS_SPOOL_DIR}/is_updating || echo "Warning: failed to release updating lock"
+}
+
+# Acquire an update lock for a repository.  Always pair with a call to
+#   release_update_lock if returns successful.
+#
+# @param name               the repository to lock
+# @param update_type        update type such as snapshot or gc
+# @param abort_on_conflict  0 to wait for lock, 1 to abort if already acquired.
+#                           Default 0.  Always aborts if initial snapshot is
+#                           in progress.
+# @return                   0 if lock successfully acquired
+
+acquire_update_lock()
+{
+  local name=$1
+  local update_type=$2
+  local abort_on_conflict=${3:-0}
+
+  load_repo_config $name
+  local update_lock=${CVMFS_SPOOL_DIR}/is_updating
+
+  # check for other updates in progress
+  if ! acquire_lock $update_lock ignore_stale; then
+    if [ $abort_on_conflict -eq 1 ]; then
+      echo "another update is in progress... aborting"
+      to_syslog_for_repo $name "did not $update_type (another update in progress)"
+      return 1
+    fi
+
+    local user_shell="$(get_user_shell $name)"
+    local initial_snapshot=0
+    if $user_shell "$(__swissknife_cmd) peek -d .cvmfs_last_snapshot -r $CVMFS_UPSTREAM_STORAGE" | grep -v -q "available"; then
+      initial_snapshot=1
+    fi
+
+    if [ $initial_snapshot -eq 1 ]; then
+      echo "an initial snapshot is in progress... aborting"
+      to_syslog_for_repo $name "did not $update_type (initial snapshot in progress)"
+      return 1
+    fi
+
+    echo "waiting for another update to finish..."
+    if ! wait_and_acquire_lock $update_lock; then
+      echo "failed to acquire update lock"
+      to_syslog_for_repo $name "did not $update_type (locking issues)"
+      return 1
+    fi
+  fi
+
+  # The lock is now acquired
 }
 
 
@@ -1393,6 +1487,8 @@ try_mount_remount_cycle_aufs() {
 
 
 # download a given file from the backend storage
+# @param name  the name of the repository to download from
+# @param url   the url to download from
 # @param noproxy  (optional)
 get_item() {
   local name="$1"
@@ -1405,6 +1501,27 @@ get_item() {
     unset http_proxy && curl $(get_follow_http_redirects_flag) "$url" 2>/dev/null
   else
     curl $(get_follow_http_redirects_flag) "$url" 2>/dev/null
+  fi
+}
+
+
+# read an item from local or backend repository storage to stdout
+# @param name  the name of the repository to download from
+# @param item  the name of the item to download
+# if the file does not exist, there will be no output and the
+#  return will be an error code
+read_repo_item() {
+  local name="$1"
+  local item="$2"
+
+  load_repo_config $name
+
+  if is_local_upstream $CVMFS_UPSTREAM_STORAGE; then
+    cat $(get_upstream_config $upstream)/"$item" 2>/dev/null
+  elif is_stratum0 $name; then
+    get_item $name $CVMFS_STRATUM0/"$item" noproxy
+  else
+    get_item $name $CVMFS_STRATUM1/"$item" noproxy
   fi
 }
 
@@ -1513,7 +1630,7 @@ get_or_guess_multiple_repository_names() {
     return 0;
   fi
 
-  for input_pattern in $@; do
+  for input_pattern in "$@"; do
     local names="$(ls --directory $repo_dir/$input_pattern 2>/dev/null)"
     if [ x"$names" = x"" ]; then
       repo_names="$repo_names $input_pattern"
@@ -1842,16 +1959,17 @@ create_whitelist() {
 
   local whitelist
   whitelist=${temp_dir}/whitelist.$name
+  local hash_algorithm="${CVMFS_HASH_ALGORITHM-sha1}"
 
   echo -n "Signing 30 day whitelist with master key... "
   echo `date -u "+%Y%m%d%H%M%S"` > ${whitelist}.unsigned
   echo "E`date -u --date='+30 days' "+%Y%m%d%H%M%S"`" >> ${whitelist}.unsigned
   echo "N$name" >> ${whitelist}.unsigned
   openssl x509 -in /etc/cvmfs/keys/${name}.crt -outform der | \
-    __swissknife hash -a $CVMFS_HASH_ALGORITHM -f >> ${whitelist}.unsigned
+    __swissknife hash -a $hash_algorithm -f >> ${whitelist}.unsigned
 
   local hash;
-  hash="`cat ${whitelist}.unsigned | __swissknife hash -a $CVMFS_HASH_ALGORITHM`"
+  hash="`cat ${whitelist}.unsigned | __swissknife hash -a $hash_algorithm`"
   echo "--" >> ${whitelist}.unsigned
   echo $hash >> ${whitelist}.unsigned
   echo -n $hash > ${whitelist}.hash
@@ -1923,6 +2041,10 @@ sign_manifest() {
   local name=$1
   local unsigned_manifest=$2
   local metainfo_file=$3
+  local return_early=
+  if [ "x$4" = "xtrue" ]; then
+    return_early="-e"
+  fi
 
   load_repo_config $name
   local user_shell="$(get_user_shell $name)"
@@ -1934,7 +2056,7 @@ sign_manifest() {
           -u $CVMFS_STRATUM0                   \
           -m $unsigned_manifest                \
           -t ${CVMFS_SPOOL_DIR}/tmp            \
-          -r $CVMFS_UPSTREAM_STORAGE"
+          -r $CVMFS_UPSTREAM_STORAGE $return_early"
 
   if [ x"$metainfo_file" != x"" ]; then
     sign_command="$sign_command -M $metainfo_file"
@@ -2263,8 +2385,6 @@ filter_auto_tags() {
   local old_tags="$(echo "$auto_tags" | while read tag_name timestamp; do
     if [ "$timestamp" -lt "$auto_tags_timespan" ]; then
       echo -n "$tag_name "
-    else
-      break
     fi
   done)"
   # Trim old_tags
@@ -2839,24 +2959,29 @@ get_editor() {
 }
 
 
+has_jq() {
+  which jq > /dev/null 2>&1
+}
+
+
 check_jq() {
-  local has_jq=1
-  if ! which jq > /dev/null 2>&1; then
-    has_jq=0
+  local hasjq=1
+  if ! has_jq; then
+    hasjq=0
     echo 1>&2
     echo "Warning: Didn't find 'jq' on your system. It is your responsibility" 1>&2
     echo "         to produce a valid JSON file." 1>&2
     echo 1>&2
     read -p "  Press any key to continue..." nirvana
   fi
-  echo $has_jq
+  echo $hasjq
 }
 
 
 validate_json() {
   local json_file="$1"
 
-  if ! which jq > /dev/null 2>&1; then
+  if ! has_jq; then
     return 0 # no jq -> assume JSON is valid
   fi
 
@@ -2894,6 +3019,39 @@ edit_json_until_valid() {
 
   return $retval
 }
+
+
+# This updates a variable in the repository status .cvmfs_status.json
+# It assumes that it is running under a repository lock.
+# @param name      the name of the repository to update
+# @param variable  the status variable to update
+# @param value     the value to set the variable to
+update_repo_status() {
+  if ! has_jq; then
+    # silently do nothing if there is no jq
+    return
+  fi
+
+  local name="$1"
+  local variable="$2"
+  local value="$3"
+
+  local old_status="$(read_repo_item $name .cvmfs_status.json)"
+  if [ -z "$old_status" ]; then
+    old_status="{}"
+  fi
+
+  load_repo_config $name
+  local user_shell="$(get_user_shell $name)"
+
+  local jq_tmp="${CVMFS_SPOOL_DIR}/tmp/status.json"
+  echo "$old_status" | jq ".$variable=\"$value\"" | $user_shell "cat > $jq_tmp"
+  $user_shell "$(__swissknife_cmd) upload -r ${CVMFS_UPSTREAM_STORAGE} \
+    -i $jq_tmp                                                     \
+    -o .cvmfs_status.json"
+  $user_shell "rm -f $jq_tmp"
+}
+
 
 create_repometa_skeleton() {
   local json_file="$1"
@@ -3939,7 +4097,7 @@ cvmfs_server_rmfs() {
   # get repository names
   shift $(($OPTIND-1))
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   for name in $names; do
@@ -4026,7 +4184,7 @@ cvmfs_server_resign() {
 
   # get repository names
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   # sanity checks
@@ -4564,7 +4722,7 @@ cvmfs_server_transaction() {
   # get repository names
   shift $(($OPTIND-1))
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   # sanity checks
@@ -4633,7 +4791,7 @@ cvmfs_server_abort() {
   # get repository names
   shift $(($OPTIND-1))
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   for name in $names; do
@@ -4760,7 +4918,7 @@ cvmfs_server_publish() {
   # get repository names
   shift $(($OPTIND-1))
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   # sanity checks
@@ -4951,6 +5109,8 @@ cvmfs_server_publish() {
     if [ ! -z "$tag_cleanup_command" ]; then
       echo "Removing outdated automatically generated tags for $name..."
       $user_shell "$tag_cleanup_command" || { publish_failed $name; die "Removing tags failed\n\nExecuted Command:\n$tag_cleanup_command";  }
+      # write intermediate history hash to reflog
+      sign_manifest $name $manifest "" true
     fi
 
     # add a tag for the new revision
@@ -5161,7 +5321,7 @@ cvmfs_server_gc() {
 
   # get repository names
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   # parse timestamp (if given)
@@ -5257,10 +5417,15 @@ cvmfs_server_gc() {
     if is_stratum0 $name; then
       base_hash="$(get_mounted_root_hash $name)"
       manifest="${CVMFS_SPOOL_DIR}/tmp/manifest"
+    fi
 
-      if [ $dry_run -eq 0 ]; then
+    if [ $dry_run -eq 0 ]; then
+      if is_stratum0 $name; then
         trap "close_transaction $name 0" EXIT HUP INT TERM
         open_transaction $name || die "Failed to open transaction for garbage collection"
+      else
+        acquire_update_lock $name gc || die "Failed to acquire update lock for garbage collection"
+        trap "release_update_lock $name" EXIT HUP INT TERM
       fi
     fi
 
@@ -5284,17 +5449,23 @@ cvmfs_server_gc() {
              "$reconstruct_this_reflog" \
              $additional_switches || die "Fail ($?)!"
 
-    # sign the result
-    if is_stratum0 $name && [ $dry_run -eq 0 ]; then
-      echo "Signing Repository Manifest"
-      if ! sign_manifest $name $manifest; then
-        to_syslog_for_repo $name "failed to sign manifest after manual garbage collection"
-        die "Fail!"
-      fi
+    if [ $dry_run -eq 0 ]; then
+      # sign the result
+      if is_stratum0 $name; then
+        echo "Signing Repository Manifest"
+        if ! sign_manifest $name $manifest; then
+          to_syslog_for_repo $name "failed to sign manifest after manual garbage collection"
+          die "Fail!"
+        fi
 
-      # close the transaction
-      trap - EXIT HUP INT TERM
-      close_transaction $name 0
+        # close the transaction
+        trap - EXIT HUP INT TERM
+        close_transaction $name 0
+      else
+        # release the update lock
+        trap - EXIT HUP INT TERM
+        release_update_lock $name
+      fi
     fi
 
     to_syslog_for_repo $name "successfully finished manual garbage collection"
@@ -5391,6 +5562,7 @@ __run_gc() {
     fi
   fi
 
+  [ $dry_run -ne 0 ] || update_repo_status $name last_gc "`date --utc`"
   [ $dry_run -ne 0 ] || to_syslog_for_repo $name "successfully finished garbage collection"
 
   return 0
@@ -5408,7 +5580,8 @@ __snapshot_cleanup() {
   $user_shell "$(__swissknife_cmd) remove     \
                  -r ${CVMFS_UPSTREAM_STORAGE} \
                  -o .cvmfs_is_snapshotting"       || echo "Warning: failed to remove .cvmfs_is_snapshotting"
-  release_lock ${CVMFS_SPOOL_DIR}/is_snapshotting || echo "Warning: failed to release snapshotting lock"
+
+  release_update_lock $alias_name
 }
 
 __snapshot_succeeded() {
@@ -5456,7 +5629,6 @@ __do_snapshot() {
     public_key=$CVMFS_PUBLIC_KEY
     timeout=$CVMFS_HTTP_TIMEOUT
     retries=$CVMFS_HTTP_RETRIES
-    snapshot_lock=${spool_dir}/is_snapshotting
 
     # more sanity checks
     is_owner_or_root $alias_name || { echo "Permission denied: Repository $alias_name is owned by $user"; retcode=1; continue; }
@@ -5472,12 +5644,22 @@ __do_snapshot() {
     fi
 
     # do it!
-    local user_shell="$(get_user_shell $alias_name)"
 
     if is_local_upstream $upstream; then
         # try to update the geodb, but continue if it doesn't work
         _update_geodb -l || true
     fi
+
+    if ! acquire_update_lock $alias_name snapshot $abort_on_conflict; then
+      retcode=1
+      continue
+    fi
+
+    local user_shell="$(get_user_shell $alias_name)"
+
+    # here the lock is acquired and needs to be cleared in case of abort
+    trap "__snapshot_failed $alias_name" EXIT HUP INT TERM
+    to_syslog_for_repo $alias_name "started snapshotting from $stratum0"
 
     local initial_snapshot=0
     local initial_snapshot_flag=""
@@ -5485,35 +5667,6 @@ __do_snapshot() {
       initial_snapshot=1
       initial_snapshot_flag="-i"
     fi
-
-    # check for other snapshots in progress
-    if ! acquire_lock $snapshot_lock; then
-      if [ $abort_on_conflict -eq 1 ]; then
-        echo "another snapshot is in progress... aborting"
-        to_syslog_for_repo $alias_name "did not snapshot (another snapshot in progress)"
-        retcode=1
-        continue
-      fi
-
-      if [ $initial_snapshot -eq 1 ]; then
-        echo "an initial snapshot is in progress... aborting"
-        to_syslog_for_repo $alias_name "did not snapshot (another initial snapshot in progress)"
-        retcode=1
-        continue
-      fi
-
-      echo "waiting for another snapshot to finish..."
-      if ! wait_and_acquire_lock $snapshot_lock; then
-        echo "failed to acquire snapshot lock"
-        to_syslog_for_repo $alias_name "did not snapshot (locking issues)"
-        retcode=1
-        continue
-      fi
-    fi
-
-    # here the lock is already acquired and needs to be cleared in case of abort
-    trap "__snapshot_failed $alias_name" EXIT HUP INT TERM
-    to_syslog_for_repo $alias_name "started snapshotting from $stratum0"
 
     local log_level=
     [ "x$CVMFS_LOG_LEVEL" != x ] && log_level="-l $CVMFS_LOG_LEVEL"
@@ -5551,6 +5704,9 @@ __do_snapshot() {
         -a $retries $with_history $with_reflog         \
            $initial_snapshot_flag $timestamp_threshold $log_level"
 
+    update_repo_status $alias_name last_snapshot "`date --utc`"
+
+    # this part is deprecated but keep for now for backward compatibility
     local last_snapshot_tmp="${spool_dir}/tmp/last_snapshot"
     $user_shell "date --utc > $last_snapshot_tmp"
     $user_shell "$(__swissknife_cmd) upload -r ${upstream} \
@@ -5749,7 +5905,7 @@ cvmfs_server_snapshot() {
 
     # get repository names
     check_parameter_count_for_multiple_repositories $#
-    alias_names=$(get_or_guess_multiple_repository_names $@)
+    alias_names=$(get_or_guess_multiple_repository_names "$@")
     check_multiple_repository_existence "$alias_names"
 
     __do_snapshot "$alias_names" $abort_on_conflict
@@ -6019,6 +6175,8 @@ _migrate_2_2() {
   [ ! -z $CVMFS_USER          ] || die "\$CVMFS_USER is not set"
   [ ! -z $CVMFS_UNION_FS_TYPE ] || die "\$CVMFS_UNION_FS_TYPE is not set"
 
+  echo "Migrating repository '$name' from CernVM-FS $(mangle_version_string $CVMFS_CREATOR_VERSION) to $(mangle_version_string $destination_version)"
+
   echo "--> umount repository"
   run_suid_helper rw_umount $name
 
@@ -6046,13 +6204,42 @@ _migrate_2_2() {
   load_repo_config $name
 }
 
+_migrate_2_3_0() {
+  local name=$1
+  local destination_version="2.3.3-1"
+  local server_conf="/etc/cvmfs/repositories.d/${name}/server.conf"
+
+  load_repo_config $name
+  echo "Migrating repository '$name' from CernVM-FS $(mangle_version_string $CVMFS_CREATOR_VERSION) to $(mangle_version_string $destination_version)"
+
+  if ! has_global_info_path; then
+    echo "--> create info resource (please update server info with 'cvmfs_server update-info')"
+    create_global_info_skeleton || die "fail"
+  fi
+
+  if ! has_apache_config_for_global_info; then
+    echo "--> create Apache configuration for info resource"
+    create_apache_config_for_global_info || die "fail (create apache config)"
+    reload_apache > /dev/null            || die "fail (reload apache)"
+  fi
+
+  echo "--> update global JSON information"
+  update_global_repository_info || die "fail"
+
+  echo "--> updating server.conf"
+  sed -i -e "s/^\(CVMFS_CREATOR_VERSION\)=.*/\1=$destination_version/" $server_conf
+
+  # update repository information
+  load_repo_config $name
+}
+
 cvmfs_server_migrate() {
   local names
   local retcode=0
 
   # get repository names
   check_parameter_count_for_multiple_repositories $#
-  names=$(get_or_guess_multiple_repository_names $@)
+  names=$(get_or_guess_multiple_repository_names "$@")
   check_multiple_repository_existence "$names"
 
   # sanity checks
@@ -6082,6 +6269,7 @@ cvmfs_server_migrate() {
     # do the migrations...
     if [ x"$creator" = x"2.1.6" ]; then
       _migrate_2_1_6 $name
+      creator="$(repository_creator_version $name)"
     fi
 
     if [ x"$creator" = x"2.1.7" -o  \
@@ -6094,6 +6282,7 @@ cvmfs_server_migrate() {
          x"$creator" = x"2.1.14" ];
     then
       _migrate_2_1_7 $name
+      creator="$(repository_creator_version $name)"
     fi
 
     if [ x"$creator" = x"2.1.15" -o   \
@@ -6105,6 +6294,7 @@ cvmfs_server_migrate() {
          is_local_upstream $CVMFS_UPSTREAM_STORAGE;
     then
       _migrate_2_1_15 $name
+      creator="$(repository_creator_version $name)"
     fi
 
     if [ x"$creator" = x"2.1.15" -o \
@@ -6116,6 +6306,7 @@ cvmfs_server_migrate() {
          x"$creator" = x"2.2.0-0" ];
     then
       _migrate_2_1_20 $name
+      creator="$(repository_creator_version $name)"
     fi
 
     if [ x"$creator" = x"2.2.0-1" -o   \
@@ -6125,6 +6316,18 @@ cvmfs_server_migrate() {
          is_stratum0 $name;
     then
       _migrate_2_2 $name
+      creator="$(repository_creator_version $name)"
+    fi
+
+    if [ x"$creator" = x"2.2.0-1" -o   \
+         x"$creator" = x"2.2.1-1" -o   \
+         x"$creator" = x"2.2.2-1" -o   \
+         x"$creator" = x"2.2.3-1" -o   \
+         x"$creator" = x"2.3.0-1" -o   \
+         x"$creator" = x"2.3.1-1" -o   \
+         x"$creator" = x"2.3.2-1" ]; then
+      _migrate_2_3_0 $name
+      creator="$(repository_creator_version $name)"
     fi
 
   done
@@ -6459,7 +6662,7 @@ cvmfs_server_mount() {
   else
     # get repository name
     check_parameter_count_for_multiple_repositories $#
-    names=$(get_or_guess_multiple_repository_names $@)
+    names=$(get_or_guess_multiple_repository_names "$@")
     check_multiple_repository_existence "$names"
   fi
 
@@ -6552,19 +6755,10 @@ fi
 subcommand=$1
 shift
 if is_subcommand $subcommand; then
-  # parse the command line arguments (keep quotation marks)
-  args=""
-  while [ $# -gt 0 ]; do
-    if echo "$1" | grep -q "[[:space:]]"; then
-      args="$args \"$1\""
-    else
-      args="$args $1"
-    fi
-    shift 1
-  done
-
   # replace a dash (-) by an underscore (_) and call the requested sub-command
-  eval "cvmfs_server_$(echo $subcommand | sed 's/-/_/g') $args"
+  # preserve spaces and quotes in the parameters: the eval removes the
+  #   single quotes here, leaving "$@" for usual shell substitution
+  eval "cvmfs_server_$(echo $subcommand | sed 's/-/_/g')" '"$@"'
 else
   usage "Unrecognized command: $subcommand"
 fi

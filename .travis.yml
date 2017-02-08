@@ -3,7 +3,6 @@ language: cpp
 
 os:
   - linux
-  - osx
 
 compiler:
   - gcc
@@ -31,7 +30,7 @@ addons:
       - gdb
 
 before_script:
-  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew update && brew install Caskroom/cask/osxfuse ; fi
+  - if [[ "$TRAVIS_OS_NAME" == "osx" ]]; then brew update && brew cask install osxfuse && brew install cmake; fi
 
 script:
   - ci/run_travis.sh

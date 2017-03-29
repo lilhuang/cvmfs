@@ -1,6 +1,7 @@
 
 %{?suse_version:%define dist .suse%suse_version}
 %if 0%{?suse_version} == 1315
+%define sle12 1
 %define dist .sle12
 %endif
 %if 0%{?el6} || 0%{?el7} || 0%{?fedora}
@@ -16,6 +17,11 @@
   %endif
 %endif
 
+# List of platforms that require systemd/autofs fix as described in CVM-1200
+%if 0%{?el7} || 0%{?fedora} || 0%{?sle12}
+%define systemd_autofs_patch 1
+%endif
+
 %define __strip /bin/true
 %define debug_package %{nil}
 %if 0%{?el6} || 0%{?el5} || 0%{?el4}
@@ -24,7 +30,7 @@
 
 Summary: CernVM File System
 Name: cvmfs
-Version: 2.3.3
+Version: 2.3.5
 Release: 1%{?dist}
 Source0: https://ecsft.cern.ch/dist/cvmfs/%{name}-%{version}.tar.gz
 %if 0%{?selinux_cvmfs}
@@ -310,6 +316,16 @@ popd
 /usr/sbin/hardlink -cv $RPM_BUILD_ROOT%{_datadir}/selinux
 %endif
 
+%if 0%{?systemd_autofs_patch}
+mkdir -p $RPM_BUILD_ROOT/usr/lib/systemd/system/autofs.service.d
+cat << EOF > $RPM_BUILD_ROOT/usr/lib/systemd/system/autofs.service.d/50-cvmfs.conf
+# Addresses distribution bug in autofs configuration
+# See CVM-1200 under https://sft.its.cern.ch/jira/browse/CVM-1200
+[Service]
+KillMode=process
+EOF
+%endif
+
 %clean
 rm -rf $RPM_BUILD_ROOT
 
@@ -324,6 +340,9 @@ done
 restorecon -R /var/lib/cvmfs
 %endif
 /sbin/ldconfig
+%if 0%{?systemd_autofs_patch}
+/usr/bin/systemctl daemon-reload
+%endif
 if [ -d /var/run/cvmfs ]; then
   /usr/bin/cvmfs_config reload
 fi
@@ -345,11 +364,11 @@ fi
 
 %postun
 if [ $1 -eq 0 ]; then
-   #sed -i "/^\/mnt\/cvmfs \/etc\/auto.cvmfs/d" /etc/auto.master
    [ -f /var/lock/subsys/autofs ] && /sbin/service autofs reload >/dev/null
    if [ -e /etc/fuse.conf ]; then
      sed -i "/added by CernVM-FS/d" /etc/fuse.conf
    fi
+   rm -f /etc/systemd/system/autofs.service.d/cvmfs-autosetup.conf
 fi
 
 %if 0%{?selinux_cvmfs}
@@ -379,6 +398,9 @@ fi
 %{_datadir}/selinux/mls/cvmfs.pp
 %{_datadir}/selinux/strict/cvmfs.pp
 %{_datadir}/selinux/targeted/cvmfs.pp
+%endif
+%if 0%{?systemd_autofs_patch}
+/usr/lib/systemd/system/autofs.service.d/50-cvmfs.conf
 %endif
 /sbin/mount.cvmfs
 %dir %{_sysconfdir}/cvmfs/config.d
@@ -426,6 +448,10 @@ fi
 %doc COPYING AUTHORS README ChangeLog
 
 %changelog
+* Wed Mar 22 2017 Jakob Blomer <jblomer@cern.ch> - 2.3.5
+- Drop systemd patch configuration for autofs where necessary
+* Mon Mar 06 2017 Jakob Blomer <jblomer@cern.ch> - 2.3.4
+- Remove systemd bugfix configuration file if necessary
 * Mon Aug 22 2016 Jakob Blomer <jblomer@cern.ch> - 2.3.1
 - Reset cvmfs_swissknife capability if overlayfs is used
 * Wed Aug 10 2016 Dave Dykstra <dwd@fnal.gov> - 2.3.1

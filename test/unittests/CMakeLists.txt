@@ -96,6 +96,7 @@ set(CVMFS_UNITTEST_FILES
   t_synchronizing_counter.cc
   t_test_utils.cc
   t_tracer.cc
+  t_tube.cc
   t_uid_map.cc
   t_unique_ptr.cc
   t_upload_facility.cc
@@ -161,6 +162,7 @@ set (CVMFS_UNITTEST_SOURCES
   ${CVMFS_SOURCE_DIR}/hash.cc
   ${CVMFS_SOURCE_DIR}/history_sql.cc
   ${CVMFS_SOURCE_DIR}/history_sqlite.cc
+  ${CVMFS_SOURCE_DIR}/ingestion/tube.cc
   ${CVMFS_SOURCE_DIR}/json_document.cc
   ${CVMFS_SOURCE_DIR}/kvstore.cc
   ${CVMFS_SOURCE_DIR}/libcvmfs.cc

@@ -925,7 +925,7 @@ cvmfs_server_update_geodb() {
 is_subcommand() {
   local subcommand="$1"
   local supported_commands="mkfs add-replica import publish rollback rmfs alterfs    \
-    resign list info tag list-tags lstags check transaction abort snapshot           \
+    resign list info tag list-tags lstags check transaction docker abort snapshot           \
     skeleton migrate list-catalogs diff checkout update-geodb gc catalog-chown \
     eliminate-hardlinks update-info update-repoinfo mount fix-permissions \
     masterkeycard"
@@ -1048,6 +1048,12 @@ Supported Commands:
                   Checks if the repository is sane
   transaction     <fully qualified name>
                   Start to edit a repository
+  docker          [-i run container from image <name>]
+                  [-c mount directory <name> as a volume at /tmp/config_files/]
+                  [-f execute command file <name> upon container launch; 
+                  provide absolute path to file]
+                  <fully qualified name>
+                  Runs release manager container
   snapshot        [-t fail if other snapshot is in progress]
                   <fully qualified name>
                   Synchronize a Stratum 1 replica with the Stratum 0 source

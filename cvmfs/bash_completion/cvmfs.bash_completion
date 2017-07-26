@@ -188,6 +188,11 @@ _cvmfs_server()
       return 0
       ;;
 
+    docker)
+      COMPREPLY=( $(compgen -W "$(__hosted_repos)" ${cur}) )
+      return 0
+      ;;
+
   esac
 }
 
